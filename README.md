@@ -1,5 +1,7 @@
 # agent-checkpoint
 
+[![tests](https://github.com/mbgulden/agent-checkpoint/actions/workflows/tests.yml/badge.svg)](https://github.com/mbgulden/agent-checkpoint/actions/workflows/tests.yml)
+
 Durable progress checkpoints for long, budget-capped agent runs.
 
 A run that hits its turn or time cap mid-thought used to leave nothing
@@ -46,6 +48,35 @@ Everything is **fail-open**: any error in config loading, cap discovery,
 tier math, rendering, or persistence degrades to a log line and a no-op.
 The plugin never breaks a turn, never blocks a tool call, and never
 prompts or waits on a person.
+
+## What a checkpoint looks like
+
+A real checkpoint file, persisted by the watchdog mid-run on the
+author's fleet (run ids and paths generalized). The worker was inside a
+single long stretch of work; the plugin wrote this itself — the worker
+only had to exist:
+
+```markdown
+# agent-checkpoint: budget checkpoint persisted mid-run (source: watchdog). The worker may not have seen a turn boundary yet; this comment is the durable record, mirrored in the checkpoint file.
+
+Budget checkpoint: you have used 0 of 10 turns (10 left) and 30m00s of 1h00m (29m59s left) — about half your budget remains; keep working at normal pace. Before continuing: write everything found so far into $HERMES_HOME/agent-checkpoints/<task-id>.md, including what remains to be done. Then continue the task.
+```
+
+Capless runs get the interval form instead:
+
+```markdown
+# agent-checkpoint: uncapped-run checkpoint 4 persisted (source: watchdog). This run has no discoverable turn or time cap, so no budget tiers apply; this checkpoint was persisted on the uncapped interval (20s) to leave a durable record. Elapsed at persist: 80s.
+
+Run: <session-id>
+Dialect: chat
+Turns so far: 0
+Elapsed: 80s
+Uncapped interval: 20s (checkpoint 4)
+```
+
+Want to watch one appear on your own install? [`demo/`](demo/) runs a
+90-second capped session in a throwaway profile and prints the
+checkpoint the watchdog persists.
 
 ## Install
 
@@ -166,6 +197,17 @@ not by itself raise task completion (fleet-only completion was flat in
 the window), and the persisted records are plugin-side state snapshots,
 not a substitute for a worker's own report. It guarantees a paper
 trail, not completion.
+
+## Support & expectations
+
+This plugin is maintained by one person, in the open, alongside the
+fleet it was built for. Issues are triaged in batches rather than
+daily; a good bug report (use the issue templates — log lines plus the
+checkpoint file, or the fact that none appeared) gets a faster answer
+than a vague one. There is no SLA and no paid support tier. Fixes ship
+as tagged releases, and the test suite in `tests/` runs in CI on every
+push, so the badge at the top of this README is the current truth
+about the code.
 
 ## License
 
