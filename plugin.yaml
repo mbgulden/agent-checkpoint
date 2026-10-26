@@ -1,0 +1,31 @@
+name: agent-checkpoint
+version: 0.3.0
+description: "Budget checkpoints for long runs: at 50% of a run's effective turn/time budget (tier 1) and at 80% time / 90% turns (tier 2, finalize), injects a durable-file persistence reminder via the pre_llm_call hook, and — since 0.2.0 — persists the checkpoint itself mid-run (checkpoint file + kanban comment) evaluated at tool-call boundaries and by a watchdog thread, so single-turn kanban runs cannot cross their budget silently. Since 0.3.0, a run with no discoverable cap gets a watchdog-persisted checkpoint every uncapped_interval_seconds (default 1800; 0 disables). Fail-open, per-session latched, and it never warns against a budget that does not exist."
+author: mbgulden
+license: MIT
+requires_hermes: ">=0.20.5"
+provides_hooks:
+  - pre_llm_call
+  - pre_tool_call
+  - post_tool_call
+  - on_session_end
+config_schema:
+  enabled: {type: bool, default: true, description: "Master switch. False makes every hook a no-op."}
+  mode: {type: str, default: snapshot, choices: [snapshot, notify, log-only], description: "snapshot injects the persistence directive; notify injects the budget numbers only; log-only records due tiers in the plugin log and injects/persists nothing."}
+  tier_fractions: {type: list, default: [0.5], description: "Tier fractions of the effective budget. The first element is the tier-1 fraction; an optional second element replaces both tier-2 per-axis fractions."}
+  tier2_time_fraction: {type: float, default: 0.8, description: "Tier 2 (finalize) threshold on the time axis."}
+  tier2_turn_fraction: {type: float, default: 0.9, description: "Tier 2 (finalize) threshold on the turn axis."}
+  min_budget_floor_turns: {type: int, default: 0, description: "A turn axis whose cap is below this is ignored."}
+  min_budget_floor_seconds: {type: float, default: 0.0, description: "A time axis whose cap (seconds) is below this is ignored."}
+  enabled_axes: {type: list, default: [time, turns], description: "Which budget axes count towards tiers: any of time, turns."}
+  checkpoint_dir: {type: str, default: "$HERMES_HOME/agent-checkpoints/", description: "Directory holding the durable checkpoint files (<run-id>.md). Values starting with $ are environment-expanded."}
+  allow_tiny_tier1: {type: bool, default: false, description: "Fire tier 1 even on tiny caps (turn cap < 10 or time cap < 5 min), where tier 1 and tier 2 would land within about 2 turns of each other."}
+  caps: {type: dict, default: {}, description: "Plugin-supplied caps for runs whose native cap is undiscoverable: {time_seconds: <float>, turns: <int>}."}
+  caps.time_seconds: {type: float, description: "Plugin-supplied time cap in seconds (part of caps). Unset means none."}
+  caps.turns: {type: int, description: "Plugin-supplied turn cap (part of caps). Unset means none."}
+  tier1_template: {type: str, description: "Custom tier-1 text; placeholders {turns_used} {turns_cap} {turns_left} {time_used} {time_cap} {time_left} {checkpoint_file}. Unset uses the shipped default."}
+  tier2_template: {type: str, description: "Custom tier-2 text; same placeholders as tier1_template. Unset uses the shipped default."}
+  mid_run_persist: {type: bool, default: true, description: "Evaluate tiers at tool-call boundaries and from the watchdog, persisting the checkpoint itself mid-run. False restores prologue-only behavior."}
+  watchdog: {type: bool, default: true, description: "Run the per-session watchdog thread that covers a run parked inside one long tool call."}
+  watchdog_poll_seconds: {type: float, default: 10.0, description: "Watchdog poll interval in seconds (floored at 0.05)."}
+  uncapped_interval_seconds: {type: float, default: 1800.0, description: "Runs with no discoverable cap: persist a checkpoint every this many elapsed seconds. The first fire also posts the kanban comment (kanban runs only); later fires are file-only. 0 disables uncapped-run coverage."}
