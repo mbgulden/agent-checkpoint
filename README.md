@@ -154,6 +154,21 @@ plugins:
         uncapped_interval_seconds: 1800
 ```
 
+## The stall watchdog
+
+Alongside the budget tiers, the watchdog also watches for a run that
+has gone silent: no tool calls and no other session events for
+`stall_window_seconds` (default **600**). When the window elapses with
+no activity, the watchdog persists a checkpoint for the stalled run.
+
+One interaction is worth knowing: a single tool call is bounded by the
+Hermes tool executor's own timeout — 420 seconds at the default
+setting — so one blocking tool call can never, by itself, reach the
+600 s stall window; the executor ends it first. The stall gate
+therefore measures silence *between* tool calls and events, not time
+spent inside one call. Work that runs long should emit progress (or
+split into steps) rather than block inside a single call.
+
 ## What it reads, writes, and runs (disclosures)
 
 - **Reads:** the kanban board DB, read-only, once per run — one
