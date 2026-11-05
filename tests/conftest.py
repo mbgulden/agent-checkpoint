@@ -1,10 +1,11 @@
 """Shared fixtures for the agent-checkpoint unit suite.
 
 Stubs the ``hermes_cli`` import surface the plugin pokes (config load, goal
-load, kanban DB path) ONLY when a test opts in via the ``use_stub`` marker
-mechanism (setting ``USE_STUBS`` on this module). This keeps the suite
-hermetic and deterministic regardless of whether the live Hermes fork is
-importable in the test shell.
+load) ONLY when a test opts in via the ``use_stub`` marker mechanism
+(setting ``USE_STUBS`` on this module). This keeps the suite hermetic and
+deterministic regardless of whether the live Hermes fork is importable in
+the test shell. The kanban board DB is NOT stubbed: cap discovery reads
+``HERMES_KANBAN_DB`` from the environment, which tests set directly.
 """
 import os
 import sys
@@ -21,7 +22,7 @@ if REPO not in sys.path:
 
 import agent_checkpoint as ac  # noqa: E402
 
-USE_STUBS = {"on": False, "config": {}, "goals": {}, "db_path": None}
+USE_STUBS = {"on": False, "config": {}, "goals": {}}
 
 _stubbed = set()
 
@@ -45,7 +46,6 @@ def _stubs(monkeypatch):
     USE_STUBS["on"] = False
     USE_STUBS["config"] = {}
     USE_STUBS["goals"] = {}
-    USE_STUBS["db_path"] = None
 
 
 @pytest.fixture(autouse=True)
@@ -64,6 +64,15 @@ def _reset_latches():
     yield
 
 
+@pytest.fixture(autouse=True)
+def _reset_plugin_ctx():
+    """No registered plugin context bleeds between tests: comment
+    posting starts from 'not registered' in every test."""
+    ac.core._PLUGIN_CTX = None
+    yield
+    ac.core._PLUGIN_CTX = None
+
+
 @pytest.fixture
 def stubs(monkeypatch):
     """Enable the hermes_cli stub surface for the calling test."""
@@ -72,7 +81,6 @@ def stubs(monkeypatch):
     hc = types.ModuleType("hermes_cli")
     cfg_mod = types.ModuleType("hermes_cli.config")
     goals_mod = types.ModuleType("hermes_cli.goals")
-    kanban_mod = types.ModuleType("hermes_cli.kanban_db")
 
     def _load_config_readonly():
         return USE_STUBS["config"]
@@ -80,17 +88,11 @@ def stubs(monkeypatch):
     def _load_goal(session_id):
         return USE_STUBS["goals"].get(session_id)
 
-    def _kanban_db_path(board=None):
-        return USE_STUBS["db_path"]
-
     cfg_mod.load_config_readonly = _load_config_readonly
     goals_mod.load_goal = _load_goal
-    kanban_mod.kanban_db_path = _kanban_db_path
     hc.config = cfg_mod
     hc.goals = goals_mod
-    hc.kanban_db = kanban_mod
     _ensure_stub("hermes_cli", hc)
     _ensure_stub("hermes_cli.config", cfg_mod)
     _ensure_stub("hermes_cli.goals", goals_mod)
-    _ensure_stub("hermes_cli.kanban_db", kanban_mod)
     yield USE_STUBS
