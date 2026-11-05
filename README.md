@@ -30,7 +30,9 @@ it can no longer fail without leaving a record of where it got to.
   per-session watchdog thread, so a run parked inside one long tool call
   still gets its checkpoint. On a mid-run crossing the plugin itself
   writes the checkpoint file and — in kanban runs — posts the checkpoint
-  as a task comment (author `agent-checkpoint`). A mid-run persist never
+  as a task comment through the `kanban_comment` tool (the comment body
+  is headed with the plugin's name; core sets the author). A mid-run
+  persist never
   suppresses the later prologue injection, and vice versa (separate
   latches per surface; each fires a tier at most once per run).
 - **Uncapped-run fallback** (0.3.0): if no cap is discoverable on either
@@ -173,7 +175,7 @@ split into steps) rather than block inside a single call.
 
 - **Reads:** the kanban board DB, read-only, once per run — one
   `SELECT max_runtime_seconds` for cap discovery (path from
-  `HERMES_KANBAN_DB` or Hermes' own kanban DB path); Hermes core config
+  `HERMES_KANBAN_DB`, which the dispatcher sets in every worker); Hermes core config
   via `load_config_readonly` (its own settings, `agent.max_turns`,
   `agent.run_budget_seconds`); goal state via `load_goal`. Environment
   variables read: `HERMES_KANBAN_TASK`, `HERMES_KANBAN_DB`,
@@ -182,11 +184,12 @@ split into steps) rather than block inside a single call.
   `$HERMES_HOME/agent-checkpoints/<run-id>.md`), written atomically
   (temp file + rename), only from mid-run persist surfaces and the
   uncapped fallback — the prologue hooks write nothing. In kanban runs,
-  a persist also posts the checkpoint as a task comment. There is no
-  public Hermes API for posting board comments, so the comment write
-  uses the board DB directly, mirroring `hermes_cli.kanban_db`'s own
-  `add_comment` write path exactly (same tables, same transaction
-  shape, author `agent-checkpoint`, body capped at 4000 chars).
+  a persist also posts the checkpoint as a task comment, through the
+  `kanban_comment` tool (dispatched via the plugin context captured at
+  registration). Core sets the comment's author and redacts the body;
+  the comment is headed with the plugin's name and capped at 4000
+  chars. The plugin never writes the board DB — its only board access
+  is the read-only cap-discovery SELECT above.
 - **Background:** one daemon watchdog thread per session. It starts on
   first hook contact, polls every `watchdog_poll_seconds`, and exits at
   session end, when the config turns it off, when the session state is
