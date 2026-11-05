@@ -58,7 +58,6 @@ manifest declares ``provides_hooks``.
 
 from __future__ import annotations
 
-import json
 import logging
 import os
 import re
@@ -103,7 +102,13 @@ WATCHDOG_GRACE_SECONDS = 180.0   # watchdog exits at cap + this grace
 # no later than a capped run's. 0 disables the fallback entirely.
 DEFAULT_UNCAPPED_INTERVAL_SECONDS = 1800.0
 COMMENT_MAX_CHARS = 4000         # kanban comment body cap for persists
-COMMENT_AUTHOR = "agent-checkpoint"
+
+# Plugin context captured by register(). The public route for posting
+# kanban comments is a tool dispatch through this context
+# (ctx.dispatch_tool("kanban_comment", ...)), so the hooks and the
+# watchdog thread keep it after registration. None until register()
+# runs; comment posting fails open while it is None.
+_PLUGIN_CTX: Any = None
 
 # Bound on latched sessions in one process (gateway hosts many).
 MAX_LATCHED_SESSIONS = 512
@@ -264,9 +269,6 @@ def _kanban_time_cap() -> Optional[float]:
     if task_id:
         try:
             db_path = os.environ.get("HERMES_KANBAN_DB")
-            if not db_path:
-                from hermes_cli.kanban_db import kanban_db_path
-                db_path = str(kanban_db_path())
             if db_path and os.path.exists(db_path):
                 con = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
                 try:
@@ -290,68 +292,26 @@ def _kanban_time_cap() -> Optional[float]:
     return None
 
 
-def _kanban_db_path() -> Optional[str]:
-    """Resolve the kanban DB path the same way cap discovery does."""
-    db_path = os.environ.get("HERMES_KANBAN_DB")
-    if not db_path:
-        try:
-            from hermes_cli.kanban_db import kanban_db_path
-            db_path = str(kanban_db_path())
-        except Exception:
-            return None
-    return db_path or None
-
-
-def _post_kanban_comment(task_id: str, body: str) -> Optional[int]:
-    """Post a comment on a kanban task, mirroring the fork's own write path
-    (``hermes_cli/kanban_db.py`` ``add_comment``) exactly: same tables, same
-    strip semantics, same ``commented`` event row, one ``BEGIN IMMEDIATE``
-    transaction. Returns the new comment id, or None when the task/DB is
-    unavailable. Fail-open: raises nothing."""
+def _post_kanban_comment(task_id: str, body: str) -> Optional[Any]:
+    """Post a comment on a kanban task via the public ``kanban_comment``
+    tool, dispatched through the plugin context captured by
+    ``register()``. Core sets the comment's author and redacts the body;
+    the plugin names itself in a header line at the top of the body
+    instead of choosing an author. Returns the dispatch result (truthy)
+    on success, or None when no context is registered or the dispatch
+    fails. Fail-open: raises nothing."""
     try:
         if not task_id or not body or not body.strip():
             return None
-        db_path = _kanban_db_path()
-        if not db_path or not os.path.exists(db_path):
+        ctx = _PLUGIN_CTX
+        if ctx is None:
             return None
-        author = COMMENT_AUTHOR
-        now = int(time.time())
-        con = sqlite3.connect(db_path, timeout=5.0)
-        try:
-            con.execute("PRAGMA journal_mode=WAL")
-            con.execute("BEGIN IMMEDIATE")
-            try:
-                if not con.execute(
-                    "SELECT 1 FROM tasks WHERE id = ?", (task_id,)
-                ).fetchone():
-                    con.execute("ROLLBACK")
-                    return None
-                cur = con.execute(
-                    "INSERT INTO task_comments "
-                    "(task_id, author, body, created_at) "
-                    "VALUES (?, ?, ?, ?)",
-                    (task_id, author.strip(), body.strip(), now),
-                )
-                payload = json.dumps(
-                    {"author": author, "len": len(body)},
-                    ensure_ascii=False)
-                con.execute(
-                    "INSERT INTO task_events "
-                    "(task_id, run_id, kind, payload, created_at) "
-                    "VALUES (?, ?, ?, ?, ?)",
-                    (task_id, None, "commented", payload,
-                     int(time.time())),
-                )
-                con.execute("COMMIT")
-                return int(cur.lastrowid or 0) or None
-            except Exception:
-                try:
-                    con.execute("ROLLBACK")
-                except Exception:
-                    pass
-                raise
-        finally:
-            con.close()
+        text = body.strip()
+        if not text.startswith(PLUGIN_ID):
+            text = f"{PLUGIN_ID}: checkpoint comment\n\n{text}"
+        result = ctx.dispatch_tool(
+            "kanban_comment", {"task_id": task_id, "body": text})
+        return result if result else True
     except Exception as exc:
         logger.warning(
             "agent-checkpoint: kanban comment post failed for %s: %s",
@@ -1357,6 +1317,8 @@ def on_session_end(session_id: str = "", task_id: str = "",
 
 def register(ctx: Any) -> None:
     """Plugin entry point (required by the Hermes plugin loader)."""
+    global _PLUGIN_CTX
+    _PLUGIN_CTX = ctx
     ctx.register_hook("pre_llm_call", on_pre_llm_call)
     ctx.register_hook("pre_tool_call", on_pre_tool_call)
     ctx.register_hook("post_tool_call", on_post_tool_call)
