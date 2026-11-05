@@ -3,8 +3,9 @@ persistence, latch separation, inert mode, and fail-open DB behavior.
 
 Hermetic, same seams as the rest of the suite: the plugin config section is
 pointed at a fixed dict, ``LATCHES.elapsed`` is replaced with a fake clock,
-and the kanban comment / checkpoint-file writers are spied (or, in two
-tests, exercised for real against a temp SQLite DB in the fork's schema).
+and the kanban comment / checkpoint-file writers are spied (or, in the
+dispatch tests below, the comment writer is exercised for real against a
+fake plugin context).
 """
 import sqlite3
 import threading
@@ -205,20 +206,19 @@ def test_inert_when_mid_run_persist_off(stubs, monkeypatch, tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# Fail-open on a DB error (+ the real writer against the fork's schema)
+# Fail-open when comment posting is unavailable (+ the real writer)
 # ---------------------------------------------------------------------------
 
-def test_comment_db_error_fails_open(stubs, monkeypatch, tmp_path):
-    """The real comment writer against an unopenable DB returns None and
-    raises nothing; the tool hook still completes and the checkpoint
-    file half of the persist still lands."""
+def test_comment_unavailable_fails_open(stubs, monkeypatch, tmp_path):
+    """The real comment writer with no plugin context registered (so the
+    kanban_comment dispatch has nowhere to go) returns None and raises
+    nothing; the tool hook still completes and the checkpoint file half
+    of the persist still lands."""
     stubs["config"] = {}
     patch_section(monkeypatch, kanban_section(tmp_path))
-    # Real writers (no spy): point the comment path at a directory that
-    # cannot be opened as a SQLite DB.
-    bad = tmp_path / "notadb"
-    bad.mkdir()
-    monkeypatch.setenv("HERMES_KANBAN_DB", str(bad))
+    # Real writers (no spy), and conftest guarantees no ctx is
+    # registered: every comment post underneath fails open to None.
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(tmp_path / "board.db"))
     monkeypatch.setenv("HERMES_KANBAN_TASK", "t_mid")
     assert ac._post_kanban_comment("t_mid", "body") is None
 
@@ -234,39 +234,58 @@ def test_comment_db_error_fails_open(stubs, monkeypatch, tmp_path):
     assert st["persisted"] == [0, 1]
 
 
-def test_comment_write_mirrors_fork_schema(stubs, monkeypatch, tmp_path):
-    """The real comment writer against a real DB in the fork's schema:
-    one task_comments row (author agent-checkpoint) + one 'commented'
-    task_events row — exactly the fork's add_comment shape."""
-    stubs["config"] = {}
-    db = tmp_path / "kanban.db"
-    con = sqlite3.connect(str(db))
-    con.execute("CREATE TABLE tasks (id TEXT PRIMARY KEY)")
-    con.execute(
-        "CREATE TABLE task_comments (id INTEGER PRIMARY KEY AUTOINCREMENT,"
-        " task_id TEXT NOT NULL, author TEXT NOT NULL, body TEXT NOT NULL,"
-        " created_at INTEGER NOT NULL)")
-    con.execute(
-        "CREATE TABLE task_events (id INTEGER PRIMARY KEY AUTOINCREMENT,"
-        " task_id TEXT NOT NULL, run_id INTEGER, kind TEXT NOT NULL,"
-        " payload TEXT, created_at INTEGER NOT NULL)")
-    con.execute("INSERT INTO tasks (id) VALUES ('t_mid')")
-    con.commit()
-    con.close()
-    monkeypatch.setenv("HERMES_KANBAN_DB", str(db))
+class _FakeCtx:
+    """Minimal plugin context: records tool dispatches."""
 
-    cid = ac._post_kanban_comment("t_mid", "hello checkpoint")
-    assert cid is not None and cid >= 1
-    con = sqlite3.connect(str(db))
-    rows = con.execute(
-        "SELECT task_id, author, body FROM task_comments").fetchall()
-    evts = con.execute(
-        "SELECT task_id, run_id, kind, payload FROM task_events").fetchall()
-    con.close()
-    assert rows == [("t_mid", "agent-checkpoint", "hello checkpoint")]
-    assert len(evts) == 1
-    assert evts[0][0] == "t_mid" and evts[0][1] is None
-    assert evts[0][2] == "commented"
-    assert '"agent-checkpoint"' in evts[0][3]
-    # Unknown task: no row, no raise.
-    assert ac._post_kanban_comment("t_nope", "body") is None
+    def __init__(self, result=None, raises=False):
+        self.calls = []
+        self.result = {"comment_id": 7} if result is None else result
+        self.raises = raises
+
+    def register_hook(self, name, fn):
+        pass
+
+    def dispatch_tool(self, name, args):
+        self.calls.append((name, args))
+        if self.raises:
+            raise RuntimeError("dispatch exploded")
+        return self.result
+
+
+def test_comment_posts_via_dispatch_tool():
+    """The real comment writer goes through the registered plugin
+    context: dispatch_tool("kanban_comment", {task_id, body}) with the
+    body headed by the plugin name (core sets the author). The dispatch
+    result is returned to the caller."""
+    ctx = _FakeCtx()
+    ac.register(ctx)  # register() captures the ctx for the hooks
+    try:
+        result = ac._post_kanban_comment("t_mid", "hello checkpoint")
+        assert result == {"comment_id": 7}
+        assert ctx.calls == [("kanban_comment", {
+            "task_id": "t_mid",
+            "body": "agent-checkpoint: checkpoint comment\n\n"
+                    "hello checkpoint",
+        })]
+        # A body that already leads with the plugin name (the persist
+        # surfaces build one) is passed through unchanged.
+        headed = "agent-checkpoint: budget checkpoint persisted mid-run"
+        assert ac._post_kanban_comment("t_mid", headed)
+        assert ctx.calls[-1][1]["body"] == headed
+        # Empty body: no dispatch, no raise.
+        assert ac._post_kanban_comment("t_mid", "  ") is None
+        assert len(ctx.calls) == 2
+    finally:
+        ac_core._PLUGIN_CTX = None
+    # No context registered: fail-open None, nothing dispatched.
+    assert ac._post_kanban_comment("t_mid", "hello checkpoint") is None
+
+
+def test_comment_dispatch_error_fails_open():
+    """A dispatch that raises degrades to None; the writer never
+    propagates (the watchdog thread calls this path)."""
+    ac.register(_FakeCtx(raises=True))
+    try:
+        assert ac._post_kanban_comment("t_mid", "body") is None
+    finally:
+        ac_core._PLUGIN_CTX = None
