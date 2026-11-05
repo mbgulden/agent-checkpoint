@@ -117,10 +117,11 @@ def test_fail_open_malformed_config(stubs):
 
 
 def test_fail_open_missing_db(stubs, tmp_path, monkeypatch):
-    """Kanban env + a board DB that doesn't exist (and no TERMINAL_TIMEOUT
-    derivation) → fail-open no-op, no exception."""
+    """Kanban env + a board DB that doesn't exist at HERMES_KANBAN_DB
+    (and no TERMINAL_TIMEOUT derivation) → fail-open no-op, no
+    exception."""
     stubs["on"] = True
-    stubs["db_path"] = str(tmp_path / "nope.db")
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(tmp_path / "nope.db"))
     monkeypatch.setenv("HERMES_KANBAN_TASK", "t_missing")
     assert ac.on_pre_llm_call(session_id="s1", task_id="t_missing",
                               is_first_turn=True) is None
@@ -133,7 +134,7 @@ def test_fail_open_corrupt_db(stubs, tmp_path, monkeypatch):
     stubs["on"] = True
     bad = tmp_path / "bad.db"
     bad.write_text("this is not sqlite")
-    stubs["db_path"] = str(bad)
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(bad))
     monkeypatch.setenv("HERMES_KANBAN_TASK", "t_bad")
     assert ac.on_pre_llm_call(session_id="s1", task_id="t_bad",
                               is_first_turn=True) is None
@@ -265,7 +266,7 @@ def test_kanban_dialect_both_axes(stubs, tmp_path, monkeypatch):
     con.commit()
     con.close()
     stubs["on"] = True
-    stubs["db_path"] = str(db)
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db))
     stubs["config"] = {"agent": {"max_turns": 20}}
     monkeypatch.setenv("HERMES_KANBAN_TASK", "t_kb")
 
