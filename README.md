@@ -144,6 +144,9 @@ Desktop settings form.
 | `watchdog` | bool | `true` | Run the per-session watchdog thread. |
 | `watchdog_poll_seconds` | float | `10.0` | Watchdog poll interval (floored at 0.05 s). Each poll reloads the config, so settings changes take effect live. |
 | `uncapped_interval_seconds` | float | `1800.0` | Capless runs: persist a checkpoint every this many elapsed seconds (boundaries are absolute multiples from run start). First fire also posts the kanban comment (kanban runs only); later fires are file-only. `0` disables uncapped-run coverage. |
+| `teeth.gate_final_tier` | bool | `false` | Final-tier tool gate (see "Teeth package" below). |
+| `teeth.movement_signal` | bool | `false` | Per-tier deliverable movement snapshots in `<run-id>.movement.json` (see below). |
+| `teeth.resume_read` | bool | `false` | Inject a prior run's checkpoint excerpt on a re-run's first turn (see below). |
 
 Example:
 
@@ -155,6 +158,53 @@ plugins:
         mode: snapshot
         uncapped_interval_seconds: 1800
 ```
+
+## Teeth package
+
+Three independently flaggable capabilities under the `teeth` settings
+mapping — all default **off**, kanban dialect only. With no `teeth`
+section, behavior is byte-identical to the pre-teeth build (proven by a
+scripted session-replay diff in the release evidence).
+
+- **`movement_signal`** — at every mid-run persist, the plugin also
+  appends a snapshot to `<checkpoint_dir>/<run-id>.movement.json`:
+  the deliverable path (parsed from the task body's DELIVERABLE-FIRST
+  clause), its size and mtime — or `missing` (path known, file not
+  created) / `unknown` (no path in the body; checkpoint growth only) —
+  plus the checkpoint file's own size. A checkpoint line inside the
+  checkpoint file carries the same reading. This is a signal for the
+  review sweep, not a verdict.
+- **`resume_read`** — on a kanban run's first turn, if an earlier run
+  of the same task left a checkpoint file, a bounded excerpt (2,000
+  chars, run id + file-time header) is injected so a successor
+  continues instead of restarting. The header tells the worker to
+  verify the excerpt against the current state before trusting it.
+- **`gate_final_tier`** — once the final tier has fired, tool calls
+  that are not finishing actions are refused through the loader's
+  `pre_tool_call` veto contract: the hook returns
+  `{"action": "block", "message": ...}` and the message becomes the
+  tool result. Read-class tools, kanban complete/block/comment (and
+  heartbeat), and any call whose arguments reference the deliverable
+  path or the checkpoint directory pass; everything else is refused.
+
+  The gate's engagement rule is deliberately narrow — **all** of these
+  must hold: the flag is on; kanban dialect; the run's cap provenance
+  is the board DB itself (`cap_source == "db"` — a configured or
+  inferred cap must never sit behind a refusal); the final tier has
+  fired; and a deliverable path was parsed from the task body (no
+  path, no gate). **Every refusal is logged and posted as a kanban
+  comment in the run**, so a false block is visible immediately. The
+  gate check itself fails open: an error in the check allows the call.
+
+**Deploy checklist** (learned 2026-11-10, when a backup copy inside
+the scanned `plugins/` root shadowed the live plugin fleet-wide):
+after copying a new build into a profile, (1) run a direct-call hash
+probe — the module the loader will exec must hash to the deployed
+file; (2) confirm the profile's `plugins/` root contains no backup
+directories (the loader keys plugins by manifest `name`, and a
+`*.bak-*` copy of the plugin directory wins the collision). Park
+backups in the profile's `plugin-backups/` directory instead — never
+inside `plugins/`.
 
 ## The stall watchdog
 
@@ -174,7 +224,8 @@ split into steps) rather than block inside a single call.
 ## What it reads, writes, and runs (disclosures)
 
 - **Reads:** the kanban board DB, read-only, once per run — one
-  `SELECT max_runtime_seconds` for cap discovery (path from
+  `SELECT max_runtime_seconds` for cap discovery and one `SELECT body`
+  for the deliverable path (teeth package; path from
   `HERMES_KANBAN_DB`, which the dispatcher sets in every worker); Hermes core config
   via `load_config_readonly` (its own settings, `agent.max_turns`,
   `agent.run_budget_seconds`); goal state via `load_goal`. Environment
@@ -189,7 +240,10 @@ split into steps) rather than block inside a single call.
   registration). Core sets the comment's author and redacts the body;
   the comment is headed with the plugin's name and capped at 4000
   chars. The plugin never writes the board DB — its only board access
-  is the read-only cap-discovery SELECT above.
+  is the read-only cap-discovery SELECT above. With the teeth flags
+  on, a persist also appends to `<run-id>.movement.json` beside the
+  checkpoint file, and a gate refusal is posted as a task comment the
+  same way.
 - **Background:** one daemon watchdog thread per session. It starts on
   first hook contact, polls every `watchdog_poll_seconds`, and exits at
   session end, when the config turns it off, when the session state is

@@ -42,6 +42,17 @@ Design constraints (locked plan 2026-10-21, ``AGENT-CHECKPOINT-PLAN.md``):
   unchanged, and a mid-run persist never suppresses the later injection
   (separate latches).
 
+* **Teeth package (2026-11-10).** Three independently flaggable
+  capabilities, all default OFF, kanban dialect only (``teeth`` config
+  section): a final-tier tool gate (``gate_final_tier``) that refuses
+  non-finishing tool calls through the loader's ``pre_tool_call`` veto
+  contract — only when the run's cap provenance is the board DB itself
+  (``cap_source == "db"``) and a deliverable path was parsed from the
+  task body; a per-tier deliverable movement signal
+  (``movement_signal``) appended to ``<run-id>.movement.json``; and a
+  successor resume excerpt (``resume_read``) injected on a re-run's
+  first turn. With no ``teeth`` section, behavior is unchanged.
+
 Hook contract (verified against the fork source): ``pre_llm_call`` fires once
 per ``run_conversation`` (per user turn / run), before the tool loop, with
 ``session_id, task_id, turn_id, user_message, conversation_history,
@@ -59,6 +70,7 @@ manifest declares ``provides_hooks``.
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 import re
@@ -132,6 +144,25 @@ class CapConfig:
 
 
 @dataclass(frozen=True)
+class TeethConfig:
+    """Teeth package switches (2026-11-10 plan). All default OFF; each is
+    independently flaggable per profile, kanban dialect only.
+
+    * ``gate_final_tier``: at the final tier, refuse tool calls that are not
+      finishing actions (see ``_gate_block``). Engages ONLY when the run's
+      cap provenance is ``db`` and a deliverable path was parsed from the
+      task body — a wrong or unverifiable cap must never sit behind a gate.
+    * ``movement_signal``: per-tier deliverable movement snapshots in
+      ``<run-id>.movement.json`` (see ``_record_movement``).
+    * ``resume_read``: on a run's first turn, inject a bounded excerpt of a
+      prior run's checkpoint file for the same task (see ``_resume_excerpt``).
+    """
+    gate_final_tier: bool = False
+    movement_signal: bool = False
+    resume_read: bool = False
+
+
+@dataclass(frozen=True)
 class PluginConfig:
     mode: str = DEFAULT_MODE
     tier_fractions: list = field(default_factory=lambda: [DEFAULT_TIER_1_FRACTION])
@@ -150,6 +181,7 @@ class PluginConfig:
     watchdog: bool = DEFAULT_WATCHDOG
     watchdog_poll_seconds: float = DEFAULT_WATCHDOG_POLL_SECONDS
     uncapped_interval_seconds: float = DEFAULT_UNCAPPED_INTERVAL_SECONDS
+    teeth: TeethConfig = field(default_factory=TeethConfig)
 
 
 def _default_config() -> PluginConfig:
@@ -205,6 +237,14 @@ def load_plugin_config() -> PluginConfig:
                 int(caps_raw["turns"]) if caps_raw.get("turns") is not None else None
             ),
         )
+        teeth_raw = section.get("teeth") or {}
+        if not isinstance(teeth_raw, dict):
+            teeth_raw = {}
+        teeth = TeethConfig(
+            gate_final_tier=bool(teeth_raw.get("gate_final_tier", False)),
+            movement_signal=bool(teeth_raw.get("movement_signal", False)),
+            resume_read=bool(teeth_raw.get("resume_read", False)),
+        )
         cp_dir = str(section.get("checkpoint_dir", DEFAULT_CHECKPOINT_DIR))
         if cp_dir.startswith("$"):
             cp_dir = os.path.expandvars(cp_dir)
@@ -244,6 +284,7 @@ def load_plugin_config() -> PluginConfig:
             uncapped_interval_seconds=max(0.0, float(section.get(
                 "uncapped_interval_seconds",
                 DEFAULT_UNCAPPED_INTERVAL_SECONDS))),
+            teeth=teeth,
         )
     except Exception as exc:  # fail-open: malformed config → defaults
         logger.warning("agent-checkpoint: config load failed (%s); using defaults", exc)
@@ -260,6 +301,14 @@ class RunCaps:
     turns_cap: Optional[int] = None
     time_cap: Optional[float] = None
     dialect: str = "chat"   # kanban | goal | chat
+    # Provenance of the caps (teeth package, 2026-11-10): "db" when a
+    # native store supplied the run's own cap (the kanban board row's
+    # max_runtime_seconds, or a goal's stored max_turns), "config" when the
+    # caps came from configuration (plugin caps, profile agent.max_turns,
+    # agent.run_budget_seconds), "none" when the run is capless. The
+    # final-tier gate engages only on "db": a cap that was configured or
+    # inferred must never sit behind a refusal.
+    cap_source: str = "none"
 
 
 def _kanban_time_cap() -> Optional[float]:
@@ -293,6 +342,67 @@ def _kanban_time_cap() -> Optional[float]:
                     return float(row[0])
         except Exception as exc:
             logger.debug("agent-checkpoint: kanban DB read failed: %s", exc)
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Deliverable-path discovery (teeth package): the movement signal and the
+# final-tier gate both need the task's deliverable path. Kanban authoring
+# names it in the body (the DELIVERABLE-FIRST clause: "create the
+# deliverable file at <PATH> ..."), and the plugin reads it from the same
+# board row it already queries for the cap. No parse → no path → movement
+# degrades to checkpoint growth only and the gate refuses to engage.
+# ---------------------------------------------------------------------------
+
+_DELIVERABLE_PATTERNS = (
+    re.compile(r"deliverable\s+file\s+at\s+`?([^\s`]+)", re.IGNORECASE),
+    re.compile(r"deliverable\s+at\s+`?([^\s`]+)", re.IGNORECASE),
+    re.compile(r"^\s*deliverable\s*:\s*`?([^\s`]+)",
+               re.IGNORECASE | re.MULTILINE),
+)
+
+
+def parse_deliverable_path(body: Optional[str]) -> Optional[str]:
+    """Extract the deliverable path from a kanban task body (fail-open).
+
+    Only path-shaped tokens count (leading ``/``, ``~/``, or ``$VAR``);
+    anything else is treated as no match rather than guessed at.
+    """
+    if not body:
+        return None
+    try:
+        for pat in _DELIVERABLE_PATTERNS:
+            m = pat.search(body)
+            if m:
+                raw = m.group(1).strip().strip("`").rstrip(".,;:")
+                if raw.startswith(("/", "~/", "$")):
+                    return os.path.expandvars(os.path.expanduser(raw))
+    except Exception as exc:
+        logger.debug("agent-checkpoint: deliverable parse failed: %s", exc)
+    return None
+
+
+def _kanban_deliverable_path() -> Optional[str]:
+    """Deliverable path from the board task body — the same DB access
+    pattern as ``_kanban_time_cap`` (read-only, fail-open → None)."""
+    task_id = os.environ.get("HERMES_KANBAN_TASK")
+    if task_id:
+        try:
+            db_path = os.environ.get("HERMES_KANBAN_DB")
+            if db_path and os.path.exists(db_path):
+                con = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+                try:
+                    row = con.execute(
+                        "SELECT body FROM tasks WHERE id = ?",
+                        (task_id,),
+                    ).fetchone()
+                finally:
+                    con.close()
+                if row and row[0]:
+                    return parse_deliverable_path(row[0])
+        except Exception as exc:
+            logger.debug(
+                "agent-checkpoint: kanban body read failed: %s", exc)
     return None
 
 
@@ -384,14 +494,22 @@ def discover_caps(session_id: str, cfg: PluginConfig) -> RunCaps:
     dialect = detect_dialect(session_id)
     turns_cap: Optional[int] = None
     time_cap: Optional[float] = None
+    native = False  # a native store supplied this run's own cap
 
     if dialect == "kanban":
         time_cap = _kanban_time_cap()
+        if time_cap is not None:
+            native = True
         # Turn axis for kanban: profile cap, then plugin caps (below).
         turns_cap = _profile_turns_cap()
     elif dialect == "goal":
         # Goal dialect is turn-axis only (no in-process wall-clock budget).
-        turns_cap = _goal_turns_cap(session_id) or _profile_turns_cap()
+        goal_cap = _goal_turns_cap(session_id)
+        if goal_cap:
+            native = True
+            turns_cap = goal_cap
+        else:
+            turns_cap = _profile_turns_cap()
     # Chat: no native budget. Armed only via plugin-configured caps or an
     # explicit ``agent.run_budget_seconds`` (read below as a time axis).
 
@@ -404,7 +522,14 @@ def discover_caps(session_id: str, cfg: PluginConfig) -> RunCaps:
     if dialect == "goal":
         time_cap = None  # no in-process time axis for goal sessions
 
-    return RunCaps(turns_cap=turns_cap, time_cap=time_cap, dialect=dialect)
+    if turns_cap is None and time_cap is None:
+        cap_source = "none"
+    elif native:
+        cap_source = "db"
+    else:
+        cap_source = "config"
+    return RunCaps(turns_cap=turns_cap, time_cap=time_cap, dialect=dialect,
+                   cap_source=cap_source)
 
 
 # ---------------------------------------------------------------------------
@@ -821,6 +946,7 @@ class SessionLatches:
                 "cfg": None,
                 "run_id": "",
                 "dialect": "chat",
+                "deliverable_path": None,
                 "uncapped_fires": 0,
                 "uncapped_commented": False,
                 "watchdog_stop": None,
@@ -904,6 +1030,11 @@ def _run_context(session_id: str, task_id: str, cfg: PluginConfig,
         st["cfg"] = cfg
         st["run_id"] = run_id
         st["dialect"] = caps.dialect
+        if caps.dialect == "kanban":
+            # One body read per run, beside the cap read — never per
+            # tool call. None is a first-class outcome (unparseable
+            # body): movement degrades, the gate stays disengaged.
+            st["deliverable_path"] = _kanban_deliverable_path()
     return caps, run_id
 
 
@@ -947,6 +1078,104 @@ def _evaluate(session_id: str, task_id: str = "",
         return None
 
 
+# ---------------------------------------------------------------------------
+# Movement signal (teeth package): a per-tier snapshot of the deliverable's
+# size/mtime, appended to ``<run-id>.movement.json`` beside the checkpoint
+# file, so the review sweep can prove mechanically whether a task's
+# deliverable moved — the input the Nov 9 audit's 50%-cap kill rule waits
+# on. A signal, never a verdict: the sweep still judges the artifact.
+# ---------------------------------------------------------------------------
+
+def _movement_path_for(cfg: PluginConfig, run_id: str) -> str:
+    """``<checkpoint_dir>/<run-id>.movement.json`` — sibling of the
+    checkpoint file."""
+    p = checkpoint_path_for(cfg, run_id)
+    if p.endswith(".md"):
+        return p[:-3] + ".movement.json"
+    return p + ".movement.json"
+
+
+def _movement_entry(cfg: PluginConfig, caps: RunCaps, plan: TierPlan,
+                    key: str, elapsed: float) -> Optional[dict]:
+    """One movement snapshot for the tiers in ``plan`` (fail-open → None).
+
+    Deliverable status is ``present`` (stat'ed), ``missing`` (path parsed
+    from the task body but the file is not there), or ``unknown`` (no path
+    parsed — the degraded, checkpoint-growth-only mode). ``checkpoint_size``
+    is filled in by the caller after the checkpoint write.
+    """
+    try:
+        st = LATCHES.get(key)
+        dpath = st.get("deliverable_path") if st else None
+        if dpath:
+            try:
+                dstat = os.stat(dpath)
+                dinfo = {"path": dpath, "status": "present",
+                         "size": dstat.st_size, "mtime": dstat.st_mtime}
+            except OSError:
+                dinfo = {"path": dpath, "status": "missing",
+                         "size": None, "mtime": None}
+        else:
+            dinfo = {"path": None, "status": "unknown",
+                     "size": None, "mtime": None}
+        return {
+            "ts": time.time(),
+            "tiers": sorted(plan.fire_tiers),
+            "elapsed": elapsed,
+            "cap_source": caps.cap_source,
+            "deliverable": dinfo,
+            "checkpoint_size": None,
+        }
+    except Exception as exc:  # fail-open, always
+        logger.warning("agent-checkpoint: movement entry failed (%s); "
+                       "no-op", exc)
+        return None
+
+
+def _movement_line(entry: dict) -> str:
+    """One-line movement summary carried inside the checkpoint file."""
+    d = entry["deliverable"]
+    if d["status"] == "present":
+        mtime = time.strftime("%Y-%m-%dT%H:%M:%SZ",
+                              time.gmtime(d["mtime"]))
+        return (f"Movement: deliverable {d['path']} — {d['size']} bytes, "
+                f"mtime {mtime}.")
+    if d["status"] == "missing":
+        return (f"Movement: deliverable {d['path']} — MISSING "
+                f"(not created yet).")
+    return ("Movement: no deliverable path named in the task body; "
+            "checkpoint growth only.")
+
+
+def _append_movement(cfg: PluginConfig, run_id: str, entry: dict) -> bool:
+    """Append ``entry`` to the run's movement doc (atomic, fail-open)."""
+    try:
+        mpath = _movement_path_for(cfg, run_id)
+        doc = None
+        if os.path.exists(mpath):
+            try:
+                with open(mpath, encoding="utf-8") as fh:
+                    doc = json.load(fh)
+            except Exception:
+                doc = None
+        if (not isinstance(doc, dict)
+                or not isinstance(doc.get("snapshots"), list)):
+            doc = {"run_id": run_id, "snapshots": []}
+        doc["snapshots"].append(entry)
+        d = os.path.dirname(mpath)
+        if d:
+            os.makedirs(d, exist_ok=True)
+        tmp = f"{mpath}.tmp-{os.getpid()}"
+        with open(tmp, "w", encoding="utf-8") as fh:
+            json.dump(doc, fh, indent=1, sort_keys=True)
+        os.replace(tmp, mpath)
+        return True
+    except Exception as exc:  # fail-open, always
+        logger.warning("agent-checkpoint: movement write failed (%s)",
+                       exc)
+        return False
+
+
 def _persist(cfg: PluginConfig, caps: RunCaps, plan: TierPlan, key: str,
              session_id: str, task_id: str, source: str,
              elapsed: float) -> list:
@@ -970,12 +1199,25 @@ def _persist(cfg: PluginConfig, caps: RunCaps, plan: TierPlan, key: str,
         if not pieces:
             return done
         body_text = "\n\n".join(t for _, t in pieces)
+        movement_entry = None
+        if cfg.teeth.movement_signal and caps.dialect == "kanban":
+            movement_entry = _movement_entry(cfg, caps, plan, key, elapsed)
+            if movement_entry is not None:
+                body_text = (body_text + "\n\n"
+                             + _movement_line(movement_entry))
         header = (f"{PLUGIN_ID}: budget checkpoint persisted mid-run "
                   f"(source: {source}). The worker may not have seen a "
                   f"turn boundary yet; this comment is the durable "
                   f"record, mirrored in the checkpoint file.")
         wrote = _write_checkpoint_file(
             path, f"# {header}\n\n{body_text}\n")
+        if movement_entry is not None:
+            try:
+                movement_entry["checkpoint_size"] = (
+                    os.path.getsize(path) if wrote else None)
+            except OSError:
+                movement_entry["checkpoint_size"] = None
+            _append_movement(cfg, run_id, movement_entry)
         comment_id = None
         if caps.dialect == "kanban":
             comment = (header + "\n\n" + body_text)[:COMMENT_MAX_CHARS]
@@ -1188,6 +1430,156 @@ def _watchdog_loop(key: str, session_id: str, task_id: str,
 
 
 # ---------------------------------------------------------------------------
+# Final-tier gate (teeth package): when a run crosses its final tier, its
+# remaining turns are for finishing. The gate refuses any tool call that is
+# not a finishing action, through the loader's pre_tool_call veto contract
+# (hermes_cli/plugins.py: a hook returning {"action": "block", "message":
+# ...} vetoes the call and the message becomes the tool result — proven
+# live on checkpoint-test, spike task t_618650bf, 2026-11-10).
+#
+# Engagement is deliberately narrow — ALL of these must hold:
+#   * the gate flag is on for this profile;
+#   * kanban dialect;
+#   * cap_source == "db" (the cap is the board row's own value — a
+#     configured or inferred cap must never sit behind a refusal);
+#   * the final tier (index 1) has fired on either latch surface;
+#   * a deliverable path was parsed from the task body (no path, no gate).
+# Every refusal is logged AND posted as a kanban comment in the run, so a
+# false block is visible immediately, not discovered at review. The gate
+# check itself is fail-open: an error in the check allows the call — a
+# buggy gate must not be able to brick a run.
+# ---------------------------------------------------------------------------
+
+# Read-class tools: they change nothing outside the conversation, so a
+# finishing run keeps them. Names verified against the fork's tool set.
+_GATE_READ_TOOLS = frozenset({
+    "read_file", "search_files", "web_search", "web_extract",
+    "skill_view", "kanban_show", "kanban_list", "todo",
+})
+
+# Kanban wrap-up calls: the channels a finishing run uses to land —
+# complete/block/comment are the plan's wrap-up set; heartbeat only
+# restates liveness and blocking it could expire the run's own claim.
+_GATE_WRAPUP_TOOLS = frozenset({
+    "kanban_complete", "kanban_block", "kanban_comment", "kanban_heartbeat",
+})
+
+
+def _gate_allows(tool_name: str, args: Any, deliverable_path: str,
+                 checkpoint_dir: str) -> bool:
+    """Gate allow rule: read-class and wrap-up tools pass outright; any
+    other call passes only when its serialized arguments reference the
+    deliverable path or the checkpoint directory."""
+    if tool_name in _GATE_READ_TOOLS or tool_name in _GATE_WRAPUP_TOOLS:
+        return True
+    try:
+        blob = json.dumps(args, default=str) if args is not None else ""
+    except Exception:
+        blob = str(args)
+    if not blob:
+        return False
+    if deliverable_path and deliverable_path in blob:
+        return True
+    if checkpoint_dir and checkpoint_dir in blob:
+        return True
+    return False
+
+
+def _gate_block(tool_name: str, args: Any, session_id: str,
+                task_id: str) -> Optional[Dict[str, str]]:
+    """The gate decision for one tool call: a block directive or None."""
+    try:
+        cfg = load_plugin_config()
+        if not cfg.enabled or not cfg.teeth.gate_final_tier:
+            return None
+        key = SessionLatches.key(session_id, task_id)
+        st = LATCHES.get(key)
+        if st is None:
+            return None
+        caps, _rid = _run_context(session_id, task_id, cfg, key)
+        if caps.dialect != "kanban" or caps.cap_source != "db":
+            return None
+        fired = st.get("fired") or []
+        persisted = st.get("persisted") or []
+        if 1 not in fired and 1 not in persisted:
+            return None
+        deliverable_path = st.get("deliverable_path")
+        if not deliverable_path:
+            return None
+        cp_dir = cfg.checkpoint_dir or DEFAULT_CHECKPOINT_DIR
+        if cp_dir.startswith("$"):
+            cp_dir = os.path.expandvars(cp_dir)
+        if _gate_allows(tool_name, args, deliverable_path, cp_dir):
+            return None
+        run_id = run_id_for(session_id, task_id)
+        message = (
+            f"agent-checkpoint gate: the final budget tier has fired "
+            f"for this run ({run_id}); only finishing actions are "
+            f"allowed — reads, kanban complete/block/comment, and calls "
+            f"that touch the deliverable ({deliverable_path}) or the "
+            f"checkpoint directory. This {tool_name or 'tool'} call was "
+            f"refused; the refusal was logged and posted on the task. "
+            f"Bring the deliverable and the checkpoint file to their "
+            f"final state and post your summary now.")
+        logger.warning("agent-checkpoint gate: refused %s for %s "
+                       "(run %s)", tool_name, key, run_id)
+        _post_kanban_comment(run_id, message)
+        return {"action": "block", "message": message}
+    except Exception as exc:  # fail-open, always
+        logger.warning("agent-checkpoint: gate check failed (%s); "
+                       "allowing the call", exc)
+        return None
+
+
+# ---------------------------------------------------------------------------
+# Successor resume (teeth package): a reclaimed run's successor currently
+# restarts from zero even though the dead run's checkpoint file is on
+# disk. On the new run's first turn, inject a bounded excerpt of that
+# file so the successor continues instead. Kanban workers are fresh
+# processes per run, so a checkpoint file that exists at the first turn
+# predates this run by construction.
+# ---------------------------------------------------------------------------
+
+RESUME_EXCERPT_MAX_CHARS = 2000
+
+
+def _resume_excerpt(session_id: str, task_id: str) -> Optional[str]:
+    """Bounded prior-checkpoint excerpt for a run's first turn (or None).
+
+    Kanban dialect only, flag-gated, fail-open. The header carries the
+    run id and the file's mtime plus a verify-before-trusting line: the
+    excerpt is a starting point, not ground truth.
+    """
+    try:
+        cfg = load_plugin_config()
+        if not cfg.enabled or not cfg.teeth.resume_read:
+            return None
+        if detect_dialect(session_id) != "kanban":
+            return None
+        run_id = run_id_for(session_id, task_id)
+        path = checkpoint_path_for(cfg, run_id)
+        if not os.path.isfile(path):
+            return None
+        mtime = os.path.getmtime(path)
+        with open(path, encoding="utf-8", errors="replace") as fh:
+            raw = fh.read(RESUME_EXCERPT_MAX_CHARS + 1)
+        if not raw.strip():
+            return None
+        excerpt = raw[:RESUME_EXCERPT_MAX_CHARS]
+        stamp = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(mtime))
+        header = (
+            f"[agent-checkpoint resume] An earlier run of this task "
+            f"({run_id}) left a checkpoint, last written {stamp}. "
+            f"Excerpt below. Verify it against the current state of "
+            f"the work before trusting it — it may be stale.\n\n")
+        return header + excerpt
+    except Exception as exc:  # fail-open, always
+        logger.warning("agent-checkpoint: resume read failed (%s); "
+                       "injecting nothing", exc)
+        return None
+
+
+# ---------------------------------------------------------------------------
 # Hook entry points
 # ---------------------------------------------------------------------------
 
@@ -1205,8 +1597,13 @@ def on_pre_llm_call(
     """
     try:
         key = SessionLatches.key(session_id, task_id)
+        resume_piece = None
         if is_first_turn:
             LATCHES.begin_run(key)
+            # Successor resume (teeth): a prior run's checkpoint excerpt
+            # rides the first turn, ahead of any tier text. Computed
+            # before this run can persist anything of its own.
+            resume_piece = _resume_excerpt(session_id, task_id)
         else:
             st = LATCHES.advance(key)
             if st is None:
@@ -1218,11 +1615,14 @@ def on_pre_llm_call(
 
         result = _evaluate(session_id, task_id, surface="inject")
         if result is None:
+            if resume_piece is not None:
+                return _build_result(resume_piece)
             return None
         cfg, caps, plan, key = result
 
         if cfg.mode == "log-only":
-            # log-only: record in the plugin log, inject nothing.
+            # log-only: record in the plugin log, inject nothing — the
+            # resume excerpt is an injection, so it is dropped here too.
             for tier in sorted(plan.fire_tiers):
                 logger.info(
                     "agent-checkpoint [log-only]: tier %d due for %s "
@@ -1236,6 +1636,8 @@ def on_pre_llm_call(
         path = checkpoint_path_for(cfg, run_id_for(session_id, task_id))
         elapsed = LATCHES.elapsed(key)
         pieces = []
+        if resume_piece is not None:
+            pieces.append(resume_piece)
         for tier in sorted(plan.fire_tiers):
             text = render_checkpoint_text(cfg, plan, tier, path)
             if text:
@@ -1285,14 +1687,22 @@ def _tool_hook(session_id: str, task_id: str, source: str) -> None:
                        source, exc)
 
 
-def on_pre_tool_call(tool_name: str = "", session_id: str = "",
-                     task_id: str = "", **_kw: Any) -> None:
-    """``pre_tool_call`` observer: evaluate tiers before a tool runs.
+def on_pre_tool_call(tool_name: str = "", args: Any = None,
+                     session_id: str = "", task_id: str = "",
+                     **_kw: Any) -> Optional[Dict[str, str]]:
+    """``pre_tool_call``: evaluate tiers before a tool runs, then apply
+    the final-tier gate (teeth package).
 
-    Returns None always — this plugin never blocks or modifies a call.
+    Normally returns None (observer). When the gate refuses a call it
+    returns the loader's block directive ``{"action": "block",
+    "message": ...}`` — the veto contract in ``hermes_cli/plugins.py``
+    (``_get_pre_tool_call_directive_details``): the message becomes the
+    tool result and the call never executes. Contract proven live on
+    checkpoint-test before this shipped (spike task t_618650bf,
+    2026-11-10).
     """
     _tool_hook(session_id, task_id, "pre_tool_call")
-    return None
+    return _gate_block(tool_name, args, session_id, task_id)
 
 
 def on_post_tool_call(tool_name: str = "", session_id: str = "",
