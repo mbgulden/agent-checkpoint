@@ -1,6 +1,6 @@
 name: agent-checkpoint
-version: 0.3.0
-description: "Budget checkpoints for long runs: at 50% of a run's effective turn/time budget (tier 1) and at 80% time / 90% turns (tier 2, finalize), injects a durable-file persistence reminder via the pre_llm_call hook, and — since 0.2.0 — persists the checkpoint itself mid-run (checkpoint file + kanban comment) evaluated at tool-call boundaries and by a watchdog thread, so single-turn kanban runs cannot cross their budget silently. Since 0.3.0, a run with no discoverable cap gets a watchdog-persisted checkpoint every uncapped_interval_seconds (default 1800; 0 disables). Fail-open, per-session latched, and it never warns against a budget that does not exist."
+version: 0.4.0
+description: "Budget checkpoints for long runs: at 50% of a run's effective turn/time budget (tier 1) and at 80% time / 90% turns (tier 2, finalize), injects a durable-file persistence reminder via the pre_llm_call hook, and — since 0.2.0 — persists the checkpoint itself mid-run (checkpoint file + kanban comment) evaluated at tool-call boundaries and by a watchdog thread, so single-turn kanban runs cannot cross their budget silently. Since 0.3.0, a run with no discoverable cap gets a watchdog-persisted checkpoint every uncapped_interval_seconds (default 1800; 0 disables). Since 0.4.0, an optional teeth package (all default off, kanban only): a final-tier tool gate that engages only on a board-DB cap with a parsed deliverable path, per-tier deliverable movement snapshots (<run-id>.movement.json), and a successor resume excerpt on a re-run's first turn. Fail-open, per-session latched, and it never warns against a budget that does not exist."
 author: mbgulden
 license: MIT
 requires_hermes: ">=0.20.5"
@@ -29,3 +29,7 @@ config_schema:
   watchdog: {type: bool, default: true, description: "Run the per-session watchdog thread that covers a run parked inside one long tool call."}
   watchdog_poll_seconds: {type: float, default: 10.0, description: "Watchdog poll interval in seconds (floored at 0.05)."}
   uncapped_interval_seconds: {type: float, default: 1800.0, description: "Runs with no discoverable cap: persist a checkpoint every this many elapsed seconds. The first fire also posts the kanban comment (kanban runs only); later fires are file-only. 0 disables uncapped-run coverage."}
+  teeth: {type: dict, default: {}, description: "Teeth package switches (0.4.0), all default off, kanban dialect only: {gate_final_tier: bool, movement_signal: bool, resume_read: bool}."}
+  teeth.gate_final_tier: {type: bool, default: false, description: "After the final tier fires, refuse non-finishing tool calls via the pre_tool_call veto. Engages only when cap_source is the board DB and a deliverable path was parsed from the task body."}
+  teeth.movement_signal: {type: bool, default: false, description: "Append a deliverable movement snapshot to <run-id>.movement.json at every mid-run persist."}
+  teeth.resume_read: {type: bool, default: false, description: "On a kanban run's first turn, inject a bounded excerpt of a prior run's checkpoint file for the same task."}

@@ -72,3 +72,55 @@ def test_no_time_axis_no_time_tier_however_long_the_run(tmp_path, monkeypatch):
     assert plan is not None
     assert plan.fire_tiers == []
     assert plan.time_left is None
+
+
+# ---------------------------------------------------------------------------
+# cap_source provenance (teeth package, 2026-11-10): the final-tier gate
+# keys on this, so the labels are pinned here. "db" = a native store
+# supplied the run's own cap; "config" = configuration supplied it;
+# "none" = capless.
+# ---------------------------------------------------------------------------
+
+def test_cap_source_db_for_board_row(stubs, tmp_path, monkeypatch):
+    """An explicit board row is a native cap: provenance 'db'."""
+    stubs["config"] = {}
+    db = _board(tmp_path, [("t_capped", 240)])
+    _kanban_env(monkeypatch, db, "t_capped")
+    caps = ac.discover_caps("s1", ac.PluginConfig())
+    assert caps.time_cap == 240.0
+    assert caps.cap_source == "db"
+
+
+def test_cap_source_config_for_plugin_caps(stubs, tmp_path, monkeypatch):
+    """NULL board row + plugin-configured cap → the cap exists but its
+    provenance is 'config', never 'db'."""
+    stubs["config"] = {}
+    db = _board(tmp_path, [("t_null", None)])
+    _kanban_env(monkeypatch, db, "t_null")
+    cfg = ac.PluginConfig(caps=ac.CapConfig(time_seconds=240))
+    caps = ac.discover_caps("s1", cfg)
+    assert caps.time_cap == 240.0
+    assert caps.cap_source == "config"
+
+
+def test_cap_source_config_for_profile_turns(stubs, tmp_path, monkeypatch):
+    """NULL board row, no plugin caps, profile agent.max_turns only →
+    'config' (this is the incident population: never 'db')."""
+    stubs["config"] = {"agent": {"max_turns": 90}}
+    db = _board(tmp_path, [("t_null", None)])
+    _kanban_env(monkeypatch, db, "t_null")
+    caps = ac.discover_caps("s1", ac.PluginConfig())
+    assert caps.time_cap is None
+    assert caps.turns_cap == 90
+    assert caps.cap_source == "config"
+
+
+def test_cap_source_none_when_capless(stubs, tmp_path, monkeypatch):
+    """NULL board row and no configured caps anywhere → 'none'."""
+    stubs["config"] = {}
+    db = _board(tmp_path, [("t_null", None)])
+    _kanban_env(monkeypatch, db, "t_null")
+    caps = ac.discover_caps("s1", ac.PluginConfig())
+    assert caps.time_cap is None
+    assert caps.turns_cap is None
+    assert caps.cap_source == "none"
