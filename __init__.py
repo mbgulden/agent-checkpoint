@@ -21,8 +21,9 @@ Design constraints (locked plan 2026-10-21, ``AGENT-CHECKPOINT-PLAN.md``):
   sessions in one gateway process never leak into each other.
 * **No caps → no budget warnings, ever.** The plugin never warns against a
   budget that does not exist: with no discoverable cap it injects nothing.
-  Cap discovery is per dialect — kanban: the board cap, or the
-  ``TERMINAL_TIMEOUT`` derivation; goal: the goal's ``max_turns``, then the
+  Cap discovery is per dialect — kanban: the board cap only (a NULL
+  ``max_runtime_seconds`` means no time axis; a cap is never derived from
+  unrelated signals); goal: the goal's ``max_turns``, then the
   profile ``agent.max_turns``; chat: plugin-configured caps (``caps``) or
   ``agent.run_budget_seconds`` only (a profile ``agent.max_turns`` alone
   never arms a chat session). Since 0.3.0 a capless run is still not
@@ -262,9 +263,19 @@ class RunCaps:
 
 
 def _kanban_time_cap() -> Optional[float]:
-    """Kanban task cap: board DB ``max_runtime_seconds`` via HERMES_KANBAN_TASK,
-    or the ``TERMINAL_TIMEOUT + 30`` derivation (the worker's terminal timeout
-    is ``max_runtime - 30s``, so the cap ≈ TERMINAL_TIMEOUT + 30)."""
+    """Kanban task cap: the board DB ``max_runtime_seconds`` via
+    HERMES_KANBAN_TASK — or None. Never derived.
+
+    A NULL row means the run's real limit lives outside the board (e.g. a
+    dispatcher default the plugin cannot see). An earlier build derived a
+    cap from ``TERMINAL_TIMEOUT + 30`` on the premise that core sets that
+    variable to ``max_runtime - 30``; in production it carries the terminal
+    tool's per-command timeout instead (180s on the fleet), which
+    manufactured a ~210s cap and fired false final-budget checkpoints
+    minutes into hours-long runs (t_6ee6ea3d runs 2026/2028, 2026-11-10).
+    No cap is the honest answer: the run keeps its turns axis and its
+    checkpoint persists, with no budget text invented for it.
+    """
     task_id = os.environ.get("HERMES_KANBAN_TASK")
     if task_id:
         try:
@@ -282,13 +293,6 @@ def _kanban_time_cap() -> Optional[float]:
                     return float(row[0])
         except Exception as exc:
             logger.debug("agent-checkpoint: kanban DB read failed: %s", exc)
-    # Fallback derivation: TERMINAL_TIMEOUT + grace.
-    tt = os.environ.get("TERMINAL_TIMEOUT")
-    if tt:
-        try:
-            return float(tt) + 30.0
-        except (TypeError, ValueError):
-            pass
     return None
 
 

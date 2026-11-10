@@ -101,7 +101,7 @@ Cap discovery is per dialect, first match wins per axis:
 
 | Dialect | Time axis | Turn axis |
 |---|---|---|
-| **kanban** (worker run; `HERMES_KANBAN_TASK` set) | the board task's `max_runtime_seconds`, read from the kanban DB; fallback: `TERMINAL_TIMEOUT` + 30 s | profile `agent.max_turns`, then plugin `caps.turns` |
+| **kanban** (worker run; `HERMES_KANBAN_TASK` set) | the board task's `max_runtime_seconds`, read from the kanban DB (NULL → no time axis; never derived) | profile `agent.max_turns`, then plugin `caps.turns` |
 | **goal** | — (no in-process time axis for goal sessions) | the goal's `max_turns`, then profile `agent.max_turns`, then plugin `caps.turns` |
 | **chat** | plugin `caps.time_seconds`, or `agent.run_budget_seconds` from the Hermes config | plugin `caps.turns` only |
 
@@ -178,8 +178,8 @@ split into steps) rather than block inside a single call.
   `HERMES_KANBAN_DB`, which the dispatcher sets in every worker); Hermes core config
   via `load_config_readonly` (its own settings, `agent.max_turns`,
   `agent.run_budget_seconds`); goal state via `load_goal`. Environment
-  variables read: `HERMES_KANBAN_TASK`, `HERMES_KANBAN_DB`,
-  `TERMINAL_TIMEOUT` — all Hermes runtime signals, none of them secrets.
+  variables read: `HERMES_KANBAN_TASK`, `HERMES_KANBAN_DB`
+  — all Hermes runtime signals, none of them secrets.
 - **Writes:** checkpoint files under `checkpoint_dir` (default
   `$HERMES_HOME/agent-checkpoints/<run-id>.md`), written atomically
   (temp file + rename), only from mid-run persist surfaces and the

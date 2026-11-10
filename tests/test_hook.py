@@ -40,7 +40,6 @@ def advance(sid, tid, n, **kw):
 def test_hook_fires_tier1_then_tier2_each_once(stubs, monkeypatch):
     """A kanban run fires tier 1 at 50% of turns and tier 2 at 90% — each
     exactly once across the run; the checkpoint path is named in tier 1."""
-    monkeypatch.setenv("TERMINAL_TIMEOUT", "5400")  # time axis: 5430s
     stubs["config"] = {}  # hermetic profile: no agent.max_turns
     patch_section(monkeypatch, {
         "caps": {"turns": 20},
@@ -71,7 +70,6 @@ def test_hook_fires_tier1_then_tier2_each_once(stubs, monkeypatch):
 
 def test_hook_latches_reset_on_new_run(stubs, monkeypatch):
     """A new run (is_first_turn) resets latches: tier 1 fires again."""
-    monkeypatch.setenv("TERMINAL_TIMEOUT", "5400")
     stubs["config"] = {}
     patch_section(monkeypatch, {"caps": {"turns": 20}})
 
@@ -90,7 +88,6 @@ def test_hook_latches_reset_on_new_run(stubs, monkeypatch):
 def test_hook_registered_mid_run_still_counts(stubs, monkeypatch):
     """Hook registered mid-run: first non-first fire begins the run and
     works (conservative elapsed) instead of crashing."""
-    monkeypatch.setenv("TERMINAL_TIMEOUT", "5400")
     stubs["config"] = {}
     patch_section(monkeypatch, {"caps": {"turns": 20}})
     r = ac.on_pre_llm_call(session_id="s1", task_id="t", is_first_turn=False)
@@ -156,7 +153,6 @@ def test_fail_open_config_section_wrong_type(stubs):
 def test_per_session_isolation(stubs, monkeypatch):
     """Two concurrent sessions: A's fired tier must not leak into B, and
     each counts its own turns."""
-    monkeypatch.setenv("TERMINAL_TIMEOUT", "5400")
     stubs["config"] = {}
     patch_section(monkeypatch, {"caps": {"turns": 20}})
 
@@ -286,7 +282,6 @@ def test_kanban_dialect_both_axes(stubs, tmp_path, monkeypatch):
 
 def test_notify_mode_numbers_only(stubs, monkeypatch):
     """notify mode: injected text has the numbers and no directive."""
-    monkeypatch.setenv("TERMINAL_TIMEOUT", "5400")
     stubs["config"] = {}
     patch_section(monkeypatch, {"mode": "notify", "caps": {"turns": 20}})
     begin(tid="t_n")
@@ -299,7 +294,6 @@ def test_notify_mode_numbers_only(stubs, monkeypatch):
 
 def test_log_only_injects_nothing(stubs, monkeypatch):
     """log-only mode: due tiers produce no injection (plugin log only)."""
-    monkeypatch.setenv("TERMINAL_TIMEOUT", "5400")
     stubs["config"] = {}
     patch_section(monkeypatch, {"mode": "log-only", "caps": {"turns": 20}})
     begin(tid="t_l")
@@ -310,7 +304,6 @@ def test_log_only_injects_nothing(stubs, monkeypatch):
 
 
 def test_disabled_injects_nothing(stubs, monkeypatch):
-    monkeypatch.setenv("TERMINAL_TIMEOUT", "5400")
     stubs["config"] = {}
     patch_section(monkeypatch, {"enabled": False})
     assert ac.on_pre_llm_call(session_id="s", task_id="t",
