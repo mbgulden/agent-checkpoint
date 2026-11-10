@@ -124,3 +124,18 @@ def test_cap_source_none_when_capless(stubs, tmp_path, monkeypatch):
     assert caps.time_cap is None
     assert caps.turns_cap is None
     assert caps.cap_source == "none"
+
+
+def test_default_cap_row_is_db_sourced(stubs, tmp_path, monkeypatch):
+    """A row materialized at 14400 by the board's default cap (kernel
+    create_task normalization + schema DEFAULT, 2026-11-10 build) is
+    indistinguishable from an authored cap: _kanban_time_cap returns
+    14400 and provenance is 'db', so the teeth tiers and the final-tier
+    gate treat the run as board-capped."""
+    stubs["config"] = {}
+    db = _board(tmp_path, [("t_defaulted", 14400)])
+    _kanban_env(monkeypatch, db, "t_defaulted")
+    assert ac._kanban_time_cap() == 14400.0
+    caps = ac.discover_caps("s1", ac.PluginConfig())
+    assert caps.time_cap == 14400.0
+    assert caps.cap_source == "db"
