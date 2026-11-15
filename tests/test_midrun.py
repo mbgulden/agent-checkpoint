@@ -66,6 +66,24 @@ def begin_kanban(monkey, sid="s1", tid="t_mid"):
                               is_first_turn=True)
 
 
+def board_db(tmp_path, tid="t_mid", cap=120):
+    """A board DB whose row carries the run's own cap (provenance db).
+
+    Since notice fix A (0.5.0), a kanban run's budget notice requires
+    the board's own cap; the surface-interplay tests below arm the cap
+    here so their subject — the persist/inject surfaces, not
+    provenance — is exercised unchanged."""
+    db = tmp_path / "board.db"
+    con = sqlite3.connect(db)
+    con.execute(
+        "CREATE TABLE tasks (id TEXT, max_runtime_seconds REAL, body TEXT)")
+    con.execute("INSERT INTO tasks VALUES (?, ?, ?)",
+                (tid, cap, "Mid-run test task."))
+    con.commit()
+    con.close()
+    return str(db)
+
+
 # ---------------------------------------------------------------------------
 # Tool-hook persist at a crossing
 # ---------------------------------------------------------------------------
@@ -153,6 +171,7 @@ def test_persist_does_not_suppress_prologue_injection(
     prologue still injects the same tier's text to the worker."""
     stubs["config"] = {}
     patch_section(monkeypatch, kanban_section(tmp_path))
+    monkeypatch.setenv("HERMES_KANBAN_DB", board_db(tmp_path))
     spy = PersistSpy(monkeypatch)
 
     assert begin_kanban(monkeypatch) is None
@@ -185,6 +204,7 @@ def test_inert_when_mid_run_persist_off(stubs, monkeypatch, tmp_path):
     stubs["config"] = {}
     patch_section(monkeypatch, kanban_section(
         tmp_path, mid_run_persist=False))
+    monkeypatch.setenv("HERMES_KANBAN_DB", board_db(tmp_path))
     spy = PersistSpy(monkeypatch)
 
     assert begin_kanban(monkeypatch) is None

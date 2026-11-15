@@ -53,6 +53,21 @@ Design constraints (locked plan 2026-10-21, ``AGENT-CHECKPOINT-PLAN.md``):
   successor resume excerpt (``resume_read``) injected on a re-run's
   first turn. With no ``teeth`` section, behavior is unchanged.
 
+* **0.5.0 additions (2026-11-15 plan).** A fourth teeth switch,
+  ``kill_at_half_cap`` (default OFF): on a board-capped kanban run whose
+  deliverable has not moved since run start, the ``pre_tool_call`` veto
+  puts the run in report mode at 50% of cap (only deliverable/report
+  writes and the kanban wrap-up channels pass; one comment names the
+  kill with the snapshot evidence), tightening to report writes only at
+  65%; any deliverable movement exits report mode and disarms the rule
+  for the run. And notice fix A: a kanban run's injected budget notice
+  is emitted only when its cap is the board's own
+  (``cap_source == "db"``) — never framed against a fallback budget the
+  board did not set. Non-kanban dialects keep their behavior (there,
+  configuration is the arming mechanism itself). Persist surfaces
+  (checkpoint file, persisted comments) are unchanged: they are the
+  durable record, not the notice.
+
 Hook contract (verified against the fork source): ``pre_llm_call`` fires once
 per ``run_conversation`` (per user turn / run), before the tool loop, with
 ``session_id, task_id, turn_id, user_message, conversation_history,
@@ -156,10 +171,17 @@ class TeethConfig:
       ``<run-id>.movement.json`` (see ``_record_movement``).
     * ``resume_read``: on a run's first turn, inject a bounded excerpt of a
       prior run's checkpoint file for the same task (see ``_resume_excerpt``).
+    * ``kill_at_half_cap``: on a board-capped run (``cap_source == "db"``,
+      deliverable path parsed) whose deliverable has not moved since run
+      start, enter report mode at 50% of cap and tighten at 65% (see
+      ``_kill_block``). The kill stops wandering, never the deliverable:
+      stage one still allows deliverable writes, and any movement exits
+      report mode and disarms the rule for the run.
     """
     gate_final_tier: bool = False
     movement_signal: bool = False
     resume_read: bool = False
+    kill_at_half_cap: bool = False
 
 
 @dataclass(frozen=True)
@@ -244,6 +266,7 @@ def load_plugin_config() -> PluginConfig:
             gate_final_tier=bool(teeth_raw.get("gate_final_tier", False)),
             movement_signal=bool(teeth_raw.get("movement_signal", False)),
             resume_read=bool(teeth_raw.get("resume_read", False)),
+            kill_at_half_cap=bool(teeth_raw.get("kill_at_half_cap", False)),
         )
         cp_dir = str(section.get("checkpoint_dir", DEFAULT_CHECKPOINT_DIR))
         if cp_dir.startswith("$"):
@@ -914,6 +937,12 @@ class SessionLatches:
         #                 "uncapped_fires": int (interval checkpoints done),
         #                 "uncapped_commented": bool (first-fire comment
         #                 attempted; later interval fires are file-only),
+        #                 "kill_baseline": dict | None (deliverable snapshot
+        #                 at run start, for the half-cap kill rule),
+        #                 "kill_stage": int (0 = normal, 1/2 = report mode),
+        #                 "kill_commented": bool (the one kill comment was
+        #                 attempted), "kill_moved": bool (deliverable moved
+        #                 at least once; kill rule disarmed for the run),
         #                 "watchdog_stop": threading.Event | None}
         self._state: Dict[str, dict] = {}
 
@@ -949,6 +978,10 @@ class SessionLatches:
                 "deliverable_path": None,
                 "uncapped_fires": 0,
                 "uncapped_commented": False,
+                "kill_baseline": None,
+                "kill_stage": 0,
+                "kill_commented": False,
+                "kill_moved": False,
                 "watchdog_stop": None,
             }
             self._state[key] = st
@@ -1035,6 +1068,16 @@ def _run_context(session_id: str, task_id: str, cfg: PluginConfig,
             # tool call. None is a first-class outcome (unparseable
             # body): movement degrades, the gate stays disengaged.
             st["deliverable_path"] = _kanban_deliverable_path()
+            # Kill-rule baseline: the deliverable's state at run start
+            # (first plugin contact), captured beside the path read.
+            # Fail-open: an uncapturable baseline stays None and the
+            # kill rule re-captures it at its first evaluation instead
+            # of judging against nothing.
+            try:
+                st["kill_baseline"] = _deliverable_snapshot(
+                    st["deliverable_path"])
+            except Exception:
+                st["kill_baseline"] = None
     return caps, run_id
 
 
@@ -1095,6 +1138,39 @@ def _movement_path_for(cfg: PluginConfig, run_id: str) -> str:
     return p + ".movement.json"
 
 
+def _deliverable_snapshot(dpath: Optional[str]) -> dict:
+    """One stat snapshot of the deliverable, in the movement entry's
+    shape: ``present`` (stat'ed), ``missing`` (path parsed from the task
+    body but the file is not there), or ``unknown`` (no path parsed).
+    Shared by the movement signal and the half-cap kill rule, so both
+    read the deliverable's state the same way. OSError → ``missing``;
+    anything else propagates to the caller's fail-open wrapper."""
+    if not dpath:
+        return {"path": None, "status": "unknown",
+                "size": None, "mtime": None}
+    try:
+        dstat = os.stat(dpath)
+        return {"path": dpath, "status": "present",
+                "size": dstat.st_size, "mtime": dstat.st_mtime}
+    except OSError:
+        return {"path": dpath, "status": "missing",
+                "size": None, "mtime": None}
+
+
+def _snapshot_moved(baseline: Optional[dict],
+                    current: Optional[dict]) -> bool:
+    """True when two deliverable snapshots differ in status, size, or
+    mtime. Any difference counts as movement — including the file
+    disappearing: the comparison fails safe toward activity, never
+    toward blocking. A missing baseline (never captured) is no evidence
+    either way → False."""
+    if not baseline or not current:
+        return False
+    return (baseline.get("status") != current.get("status")
+            or baseline.get("size") != current.get("size")
+            or baseline.get("mtime") != current.get("mtime"))
+
+
 def _movement_entry(cfg: PluginConfig, caps: RunCaps, plan: TierPlan,
                     key: str, elapsed: float) -> Optional[dict]:
     """One movement snapshot for the tiers in ``plan`` (fail-open → None).
@@ -1107,17 +1183,7 @@ def _movement_entry(cfg: PluginConfig, caps: RunCaps, plan: TierPlan,
     try:
         st = LATCHES.get(key)
         dpath = st.get("deliverable_path") if st else None
-        if dpath:
-            try:
-                dstat = os.stat(dpath)
-                dinfo = {"path": dpath, "status": "present",
-                         "size": dstat.st_size, "mtime": dstat.st_mtime}
-            except OSError:
-                dinfo = {"path": dpath, "status": "missing",
-                         "size": None, "mtime": None}
-        else:
-            dinfo = {"path": None, "status": "unknown",
-                     "size": None, "mtime": None}
+        dinfo = _deliverable_snapshot(dpath)
         return {
             "ts": time.time(),
             "tiers": sorted(plan.fire_tiers),
@@ -1532,6 +1598,176 @@ def _gate_block(tool_name: str, args: Any, session_id: str,
 
 
 # ---------------------------------------------------------------------------
+# Half-cap kill rule (teeth package, 0.5.0): the Nov 9 audit's 50%-cap
+# kill rule, activated on Michael's approval (Nov 15, 2026). A board-capped
+# run whose deliverable has not moved by half its cap is not stuck on a
+# hard problem — it is wandering, and every further out-of-scope call
+# burns budget a re-scope could spend. Report mode reserves the rest of
+# the run for the two things that make a re-scope cheap: the deliverable
+# itself and the report.
+#
+# Engagement is deliberately narrow, mirroring the gate:
+#   * the kill flag is on for this profile;
+#   * kanban dialect;
+#   * cap_source == "db" (a configured or inferred cap must never sit
+#     behind a refusal — the gate's provenance rule, unchanged);
+#   * a deliverable path was parsed from the task body;
+#   * the deliverable snapshot is unchanged since run start (baseline
+#     captured in ``_run_context``; any difference counts as movement).
+# Stage 1 (>= 50% of cap): the kanban wrap-up channels pass outright, and
+# any other call passes only when its args reference the deliverable or
+# the checkpoint file. Stage 2 (>= 65%): only the checkpoint file passes
+# — the deliverable's remaining budget belongs to the report. Entering
+# report mode posts ONE kanban comment naming the kill and the snapshot
+# evidence; stage transitions are logged, never re-commented. Any
+# deliverable movement exits report mode and disarms the rule for the
+# run. The check is fail-open, like the gate: an error allows the call.
+# ---------------------------------------------------------------------------
+
+KILL_STAGE1_FRACTION = 0.50
+KILL_STAGE2_FRACTION = 0.65
+
+
+def _kill_allows(tool_name: str, args: Any, stage: int,
+                 deliverable_path: str, checkpoint_path: str) -> bool:
+    """Report-mode allow rule: kanban wrap-up calls pass outright (the
+    worker must always be able to land — complete/block/comment are how
+    it files the report this mode exists to force, and heartbeat keeps
+    its own claim alive); any other call passes only when its serialized
+    arguments reference an allowed path — the checkpoint file in both
+    stages, plus the deliverable in stage 1."""
+    if tool_name in _GATE_WRAPUP_TOOLS:
+        return True
+    try:
+        blob = json.dumps(args, default=str) if args is not None else ""
+    except Exception:
+        blob = str(args)
+    if not blob:
+        return False
+    if checkpoint_path and checkpoint_path in blob:
+        return True
+    if stage == 1 and deliverable_path and deliverable_path in blob:
+        return True
+    return False
+
+
+def _snapshot_desc(snap: Optional[dict]) -> str:
+    """One-line deliverable snapshot for kill messages and comments."""
+    if not snap:
+        return "no baseline snapshot"
+    if snap.get("status") == "present":
+        mtime = time.strftime("%Y-%m-%dT%H:%M:%SZ",
+                              time.gmtime(snap.get("mtime") or 0))
+        return f"{snap.get('size')} bytes, mtime {mtime}"
+    return str(snap.get("status"))
+
+
+def _kill_block(tool_name: str, args: Any, session_id: str,
+                task_id: str) -> Optional[Dict[str, str]]:
+    """The kill-rule decision for one tool call: a block directive while
+    the run is in report mode, else None."""
+    try:
+        cfg = load_plugin_config()
+        if not cfg.enabled or not cfg.teeth.kill_at_half_cap:
+            return None
+        key = SessionLatches.key(session_id, task_id)
+        st = LATCHES.get(key)
+        if st is None:
+            return None
+        caps, _rid = _run_context(session_id, task_id, cfg, key)
+        if caps.dialect != "kanban" or caps.cap_source != "db":
+            return None
+        deliverable_path = st.get("deliverable_path")
+        if not deliverable_path:
+            return None
+        if st.get("kill_moved"):
+            return None  # the deliverable moved once: rule disarmed
+        baseline = st.get("kill_baseline")
+        if baseline is None:
+            # Baseline capture failed at run start; take it now and
+            # judge from the next call — never judge against nothing.
+            st["kill_baseline"] = _deliverable_snapshot(deliverable_path)
+            return None
+        current = _deliverable_snapshot(deliverable_path)
+        if _snapshot_moved(baseline, current):
+            if st.get("kill_stage"):
+                logger.info(
+                    "agent-checkpoint kill: report mode exited for %s "
+                    "(deliverable moved)", key)
+            st["kill_moved"] = True
+            st["kill_stage"] = 0
+            return None
+        # Effective fraction consumed: the max across the axes that
+        # exist — the tier-1 semantics.
+        fracs = []
+        if caps.time_cap:
+            fracs.append(LATCHES.elapsed(key) / float(caps.time_cap))
+        if caps.turns_cap and int(caps.turns_cap) > 0:
+            fracs.append(int(st.get("turns") or 0) / int(caps.turns_cap))
+        if not fracs:
+            return None
+        frac = max(fracs)
+        if frac < KILL_STAGE1_FRACTION:
+            return None
+        stage = 2 if frac >= KILL_STAGE2_FRACTION else 1
+        run_id = run_id_for(session_id, task_id)
+        checkpoint_path = checkpoint_path_for(cfg, run_id)
+        if stage > int(st.get("kill_stage") or 0):
+            st["kill_stage"] = stage
+            logger.warning(
+                "agent-checkpoint kill: report mode stage %d for %s "
+                "(run %s) at %.0f%% of cap; deliverable %s unchanged "
+                "since run start (%s)",
+                stage, key, run_id, frac * 100, deliverable_path,
+                _snapshot_desc(baseline))
+            if not st.get("kill_commented"):
+                st["kill_commented"] = True
+                _post_kanban_comment(run_id, (
+                    f"agent-checkpoint kill rule: report mode (stage "
+                    f"{stage}) at {frac:.0%} of this run's board cap. "
+                    f"The deliverable ({deliverable_path}) has not "
+                    f"moved since run start — snapshot at entry: "
+                    f"{_snapshot_desc(current)}; baseline: "
+                    f"{_snapshot_desc(baseline)}. Remaining budget is "
+                    f"reserved for the deliverable and the report; "
+                    f"out-of-scope tool calls are refused. One comment "
+                    f"per run by design; stage changes are in the "
+                    f"plugin log."))
+        if _kill_allows(tool_name, args, stage, deliverable_path,
+                        checkpoint_path):
+            return None
+        if stage == 2:
+            allowed = (f"Only the checkpoint file ({checkpoint_path}), "
+                       f"kanban comment/complete/block, and heartbeat "
+                       f"calls are allowed now. ")
+        else:
+            allowed = (f"Only calls touching the deliverable "
+                       f"({deliverable_path}) or the checkpoint file "
+                       f"({checkpoint_path}), plus kanban "
+                       f"comment/complete/block and heartbeat, are "
+                       f"allowed now. ")
+        message = (
+            f"agent-checkpoint kill rule: this run ({run_id}) is in "
+            f"report mode (stage {stage}) — {frac:.0%} of the board "
+            f"cap used with no deliverable movement since run start "
+            f"(deliverable {deliverable_path}: "
+            f"{_snapshot_desc(current)}). "
+            + allowed
+            + "Bring the deliverable and the checkpoint file to their "
+            "final state for this run — if the work is unfinished, "
+            "mark it INCOMPLETE with the exact next step — and post "
+            "your summary now.")
+        logger.warning("agent-checkpoint kill: refused %s for %s "
+                       "(run %s, stage %d)", tool_name, key, run_id,
+                       stage)
+        return {"action": "block", "message": message}
+    except Exception as exc:  # fail-open, always
+        logger.warning("agent-checkpoint: kill check failed (%s); "
+                       "allowing the call", exc)
+        return None
+
+
+# ---------------------------------------------------------------------------
 # Successor resume (teeth package): a reclaimed run's successor currently
 # restarts from zero even though the dead run's checkpoint file is on
 # disk. On the new run's first turn, inject a bounded excerpt of that
@@ -1577,6 +1813,33 @@ def _resume_excerpt(session_id: str, task_id: str) -> Optional[str]:
         logger.warning("agent-checkpoint: resume read failed (%s); "
                        "injecting nothing", exc)
         return None
+
+
+# ---------------------------------------------------------------------------
+# Notice fix A (0.5.0): provenance-aware suppression of the budget notice
+# ---------------------------------------------------------------------------
+
+def _budget_notice_allowed(caps: RunCaps) -> bool:
+    """Notice fix A (0.5.0), scoped to where the phantom budget lives.
+
+    A KANBAN run's budget notice is emitted only when its cap is the
+    board's own (``cap_source == "db"``). A kanban run whose budget fell
+    back to configuration (NULL board row → profile/plugin caps) or that
+    has no budget at all gets no budget notice: the board never set that
+    budget, and framing a checkpoint against it is the phantom-budget
+    failure shape (2026-11-10). Board-capped kanban runs are unchanged.
+
+    Non-kanban dialects are untouched: there, configuration IS the
+    arming mechanism (a chat session arms via plugin caps or
+    ``agent.run_budget_seconds``; a goal's stored cap is ``db``), so
+    suppressing there would silence deliberately armed runs — the exact
+    case provenance-aware suppression exists to preserve.
+    """
+    if caps is None:
+        return False
+    if caps.dialect != "kanban":
+        return True
+    return caps.cap_source == "db"
 
 
 # ---------------------------------------------------------------------------
@@ -1638,18 +1901,38 @@ def on_pre_llm_call(
         pieces = []
         if resume_piece is not None:
             pieces.append(resume_piece)
+        tier_texts = []
         for tier in sorted(plan.fire_tiers):
             text = render_checkpoint_text(cfg, plan, tier, path)
             if text:
-                pieces.append(text)
-                logger.info(
-                    "agent-checkpoint: tier %d fired for %s (dialect=%s, "
-                    "turns=%s/%s, elapsed=%.0fs/%s)",
-                    tier, key, caps.dialect,
-                    plan.turns_used, plan.turns_cap, elapsed,
-                    f"{caps.time_cap:.0f}" if caps.time_cap else "-",
-                )
+                tier_texts.append((tier, text))
+        notice_suppressed = False
+        if tier_texts and not _budget_notice_allowed(caps):
+            # Notice fix A (0.5.0): suppress the notice, but still latch
+            # the tiers below — the provenance decision cannot change
+            # mid-run (caps are cached at first evaluation), so the
+            # notice must not re-offer itself every turn. The persist
+            # surfaces are untouched: the checkpoint file is the durable
+            # record, not the notice.
+            logger.info(
+                "agent-checkpoint: budget notice suppressed for %s "
+                "(dialect=%s, cap_source=%s); a kanban run's notice "
+                "requires the board's own cap",
+                key, caps.dialect, caps.cap_source)
+            tier_texts = []
+            notice_suppressed = True
+        for tier, text in tier_texts:
+            pieces.append(text)
+            logger.info(
+                "agent-checkpoint: tier %d fired for %s (dialect=%s, "
+                "turns=%s/%s, elapsed=%.0fs/%s)",
+                tier, key, caps.dialect,
+                plan.turns_used, plan.turns_cap, elapsed,
+                f"{caps.time_cap:.0f}" if caps.time_cap else "-",
+            )
         if not pieces:
+            if notice_suppressed:
+                LATCHES.mark_fired(key, plan.fire_tiers)
             return None
         LATCHES.mark_fired(key, plan.fire_tiers)
         return _build_result("\n\n".join(pieces))
@@ -1691,9 +1974,10 @@ def on_pre_tool_call(tool_name: str = "", args: Any = None,
                      session_id: str = "", task_id: str = "",
                      **_kw: Any) -> Optional[Dict[str, str]]:
     """``pre_tool_call``: evaluate tiers before a tool runs, then apply
-    the final-tier gate (teeth package).
+    the teeth vetoes — the half-cap kill rule (0.5.0) first, then the
+    final-tier gate.
 
-    Normally returns None (observer). When the gate refuses a call it
+    Normally returns None (observer). When a veto refuses a call it
     returns the loader's block directive ``{"action": "block",
     "message": ...}`` — the veto contract in ``hermes_cli/plugins.py``
     (``_get_pre_tool_call_directive_details``): the message becomes the
@@ -1702,6 +1986,9 @@ def on_pre_tool_call(tool_name: str = "", args: Any = None,
     2026-11-10).
     """
     _tool_hook(session_id, task_id, "pre_tool_call")
+    kill = _kill_block(tool_name, args, session_id, task_id)
+    if kill is not None:
+        return kill
     return _gate_block(tool_name, args, session_id, task_id)
 
 

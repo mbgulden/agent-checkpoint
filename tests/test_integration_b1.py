@@ -15,6 +15,7 @@ checkpoint filename is the stable board task id (never the per-turn uuid).
 Caps are supplied via the hermetic ``_read_config_section`` seam (the same
 seam test_hook.py uses) so they are dialect-independent.
 """
+import sqlite3
 import uuid
 
 import agent_checkpoint as ac
@@ -75,11 +76,24 @@ def test_as_shipped_bug_is_gone_no_latch_leak(stubs, monkeypatch):
     assert sorted(ac.LATCHES.snapshot()["sess-2"]["fired"]) == [0, 1]
 
 
-def test_checkpoint_filename_uses_kanban_board_task_id(stubs, monkeypatch):
+def test_checkpoint_filename_uses_kanban_board_task_id(stubs, monkeypatch,
+                                                      tmp_path):
     """Tier 1 and tier 2 name the SAME stable file = the board task id
     (HERMES_KANBAN_TASK), never the per-turn uuid task_id kwarg."""
     monkeypatch.setenv("HERMES_KANBAN_TASK", "t_boardtask")
-    monkeypatch.delenv("HERMES_KANBAN_DB", raising=False)
+    # A board row carrying the run's own cap (provenance db): since
+    # notice fix A (0.5.0) a kanban run's budget notice requires the
+    # board's own cap. The turns axis (SECTION caps) still drives the
+    # tiers; this test's subject is the checkpoint filename.
+    db = tmp_path / "board.db"
+    con = sqlite3.connect(db)
+    con.execute(
+        "CREATE TABLE tasks (id TEXT, max_runtime_seconds REAL, body TEXT)")
+    con.execute("INSERT INTO tasks VALUES (?, ?, ?)",
+                ("t_boardtask", 3600, "B1 filename test task."))
+    con.commit()
+    con.close()
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db))
     monkeypatch.setattr(ac_core, "_read_config_section", lambda: dict(SECTION))
     ac.LATCHES._state.clear()
     t1 = t2 = None
