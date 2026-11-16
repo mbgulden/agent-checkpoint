@@ -68,6 +68,23 @@ Design constraints (locked plan 2026-10-21, ``AGENT-CHECKPOINT-PLAN.md``):
   (checkpoint file, persisted comments) are unchanged: they are the
   durable record, not the notice.
 
+* **0.6.0 additions (2026-11-15 plan, WS3).** Two more capabilities,
+  both default OFF. A completion-contract gate (``teeth.contract_gate``):
+  when a kanban task body declares a PR contract on a ``Contract:``
+  line (repo, PR number, required checks), a ``kanban_complete`` call
+  for that task is refused while the PR's required checks are not all
+  green on the PR's current head — read read-only through the ``gh``
+  CLI. The gate fails OPEN on any ``gh`` error (missing binary, network
+  failure, unparsable output): the completion is allowed and a comment
+  notes the gate could not verify. It refuses only on proven non-green
+  state (red, still pending, or no result for a required check on the
+  current head — stale evidence). Non-contract cards are untouched.
+  And a token-budget axis: ``tokens`` joins ``enabled_axes``; where the
+  host exposes the run's token usage and a token budget is configured
+  (``caps.tokens``), checkpoint tiers evaluate on token fraction
+  exactly as on the time axis (tier 1 at the effective 50%, tier 2 at
+  80%). Absent usage data, the axis is inert — no notices, no errors.
+
 Hook contract (verified against the fork source): ``pre_llm_call`` fires once
 per ``run_conversation`` (per user turn / run), before the tool loop, with
 ``session_id, task_id, turn_id, user_message, conversation_history,
@@ -90,6 +107,7 @@ import logging
 import os
 import re
 import sqlite3
+import subprocess
 import threading
 import time
 from dataclasses import dataclass, field
@@ -154,8 +172,13 @@ PLUGIN_ID = "agent-checkpoint"
 @dataclass(frozen=True)
 class CapConfig:
     """Plugin-supplied caps for runs whose native cap is undiscoverable."""
+
     time_seconds: Optional[float] = None
     turns: Optional[int] = None
+    # Token-budget axis (0.6.0): the run's token budget, armed the same
+    # way as the other plugin caps. The axis also needs the host to
+    # expose usage (see ``_tokens_used``); a budget alone fires nothing.
+    tokens: Optional[int] = None
 
 
 @dataclass(frozen=True)
@@ -177,11 +200,20 @@ class TeethConfig:
       ``_kill_block``). The kill stops wandering, never the deliverable:
       stage one still allows deliverable writes, and any movement exits
       report mode and disarms the rule for the run.
+    * ``contract_gate`` (0.6.0): on a kanban run whose task body declares
+      a PR contract (``Contract:`` line), refuse ``kanban_complete``
+      while the PR's required checks are not all green on its current
+      head (see ``_contract_block``). Provenance rule differs from the
+      other teeth by design: the evidence is the PR's own check state,
+      read live through ``gh`` — the gate fails open on any ``gh``
+      error and refuses only on proven non-green state.
     """
+
     gate_final_tier: bool = False
     movement_signal: bool = False
     resume_read: bool = False
     kill_at_half_cap: bool = False
+    contract_gate: bool = False
 
 
 @dataclass(frozen=True)
@@ -258,6 +290,9 @@ def load_plugin_config() -> PluginConfig:
             turns=(
                 int(caps_raw["turns"]) if caps_raw.get("turns") is not None else None
             ),
+            tokens=(
+                int(caps_raw["tokens"]) if caps_raw.get("tokens") is not None else None
+            ),
         )
         teeth_raw = section.get("teeth") or {}
         if not isinstance(teeth_raw, dict):
@@ -267,6 +302,7 @@ def load_plugin_config() -> PluginConfig:
             movement_signal=bool(teeth_raw.get("movement_signal", False)),
             resume_read=bool(teeth_raw.get("resume_read", False)),
             kill_at_half_cap=bool(teeth_raw.get("kill_at_half_cap", False)),
+            contract_gate=bool(teeth_raw.get("contract_gate", False)),
         )
         cp_dir = str(section.get("checkpoint_dir", DEFAULT_CHECKPOINT_DIR))
         if cp_dir.startswith("$"):
@@ -276,9 +312,11 @@ def load_plugin_config() -> PluginConfig:
             ax = ("time", "turns")
         elif isinstance(ax_raw, (list, tuple)) and ax_raw:
             ax = tuple(str(a) for a in ax_raw)
-            bad = [a for a in ax if a not in ("time", "turns")]
+            bad = [a for a in ax if a not in ("time", "turns", "tokens")]
             if bad:
-                logger.warning("agent-checkpoint: bad enabled_axes %s; ignoring", ax_raw)
+                logger.warning(
+                    "agent-checkpoint: bad enabled_axes %s; ignoring", ax_raw
+                )
                 ax = ("time", "turns")
         else:
             ax = ("time", "turns")
@@ -332,6 +370,11 @@ class RunCaps:
     # final-tier gate engages only on "db": a cap that was configured or
     # inferred must never sit behind a refusal.
     cap_source: str = "none"
+    # Token-budget axis (0.6.0): the run's token budget, from the plugin
+    # ``caps.tokens`` config — armed like the other configured caps. The
+    # axis additionally needs live usage (``_tokens_used``); a budget
+    # with no usage source is inert, never estimated.
+    tokens_cap: Optional[int] = None
 
 
 def _kanban_time_cap() -> Optional[float]:
@@ -427,6 +470,87 @@ def _kanban_deliverable_path() -> Optional[str]:
             logger.debug(
                 "agent-checkpoint: kanban body read failed: %s", exc)
     return None
+
+
+def _kanban_task_body() -> Optional[str]:
+    """The board task's body text — the same read-only DB access pattern
+    as ``_kanban_time_cap`` / ``_kanban_deliverable_path`` (fail-open →
+    None). Used by the completion-contract gate (0.6.0)."""
+    task_id = os.environ.get("HERMES_KANBAN_TASK")
+    if task_id:
+        try:
+            db_path = os.environ.get("HERMES_KANBAN_DB")
+            if db_path and os.path.exists(db_path):
+                con = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+                try:
+                    row = con.execute(
+                        "SELECT body FROM tasks WHERE id = ?",
+                        (task_id,),
+                    ).fetchone()
+                finally:
+                    con.close()
+                if row and row[0]:
+                    return row[0]
+        except Exception as exc:
+            logger.debug("agent-checkpoint: kanban body read failed: %s", exc)
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Completion-contract discovery (0.6.0): a PR-producing kanban card can
+# declare its completion contract in the body, on one line:
+#
+#     Contract: <owner/repo> PR #<n>; required checks: <name>, <name>, ...
+#
+# The contract gate (``_contract_block``) refuses ``kanban_complete``
+# while the named PR's required checks are not all green on the PR's
+# current head. No line → no contract → the card is untouched.
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class ContractSpec:
+    """One parsed ``Contract:`` line from a kanban task body."""
+
+    repo: str  # "owner/repo"
+    pr_number: int
+    required_checks: tuple  # check names, in body order
+
+
+_CONTRACT_PATTERN = re.compile(
+    r"^\s*contract\s*:\s*`?([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)`?"
+    r"\s+PR\s+#(\d+)\s*;\s*required\s+checks\s*:\s*(.+)$",
+    re.IGNORECASE | re.MULTILINE,
+)
+
+
+def parse_contract(body: Optional[str]) -> Optional[ContractSpec]:
+    """Extract the completion contract from a kanban task body
+    (fail-open → None). The shape is exact — repo, ``PR #<n>``, and a
+    non-empty comma-separated required-checks list; anything else is
+    treated as no contract rather than guessed at."""
+    if not body:
+        return None
+    try:
+        m = _CONTRACT_PATTERN.search(body)
+        if not m:
+            return None
+        checks = tuple(c.strip().strip("`") for c in m.group(3).split(","))
+        checks = tuple(c for c in checks if c)
+        if not checks:
+            return None
+        return ContractSpec(
+            repo=m.group(1), pr_number=int(m.group(2)), required_checks=checks
+        )
+    except Exception as exc:
+        logger.debug("agent-checkpoint: contract parse failed: %s", exc)
+        return None
+
+
+def _kanban_contract() -> Optional[ContractSpec]:
+    """The run's completion contract from the board task body — one
+    read per run, cached on the latch state by ``_run_context``."""
+    return parse_contract(_kanban_task_body())
 
 
 def _post_kanban_comment(task_id: str, body: str) -> Optional[Any]:
@@ -545,14 +669,77 @@ def discover_caps(session_id: str, cfg: PluginConfig) -> RunCaps:
     if dialect == "goal":
         time_cap = None  # no in-process time axis for goal sessions
 
-    if turns_cap is None and time_cap is None:
+    # Token budget (0.6.0): plugin-configured only, like the caps above.
+    tokens_cap = cfg.caps.tokens
+
+    if turns_cap is None and time_cap is None and tokens_cap is None:
         cap_source = "none"
     elif native:
         cap_source = "db"
     else:
         cap_source = "config"
-    return RunCaps(turns_cap=turns_cap, time_cap=time_cap, dialect=dialect,
-                   cap_source=cap_source)
+    return RunCaps(
+        turns_cap=turns_cap,
+        time_cap=time_cap,
+        dialect=dialect,
+        cap_source=cap_source,
+        tokens_cap=tokens_cap,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Token usage discovery (0.6.0): the token axis fires only where the host
+# exposes the run's token usage. The plugin has no agent object, so the
+# exposures are the same kinds it already reads for caps — environment
+# and the board DB — tried in order, all fail-open. No source → None →
+# the axis is inert: a token budget is never evaluated against usage
+# the plugin invented.
+# ---------------------------------------------------------------------------
+
+# Candidate token columns on the board's task_runs table, probed via
+# PRAGMA so a fork schema without any of them simply yields no usage.
+_TOKEN_COLUMNS = ("tokens_used", "total_tokens", "tokens", "token_count")
+
+
+def _tokens_used(session_id: str, caps: RunCaps) -> Optional[int]:
+    """The run's token usage so far, or None when no host source
+    exposes it (fail-open; the token axis stays inert on None).
+
+    Sources, in order:
+    * ``HERMES_RUN_TOKENS_USED`` in the environment — the trivial
+      exposure a host or wrapper can set per run;
+    * the current run's row in the kanban board DB (``task_runs``),
+      when the board schema carries a token column — the dispatcher
+      records per-run token totals there.
+    """
+    try:
+        raw = os.environ.get("HERMES_RUN_TOKENS_USED")
+        if raw:
+            try:
+                return int(float(raw))
+            except (TypeError, ValueError):
+                pass  # unparsable env value: fall through to the DB
+        if caps is not None and caps.dialect == "kanban":
+            task_id = os.environ.get("HERMES_KANBAN_TASK")
+            db_path = os.environ.get("HERMES_KANBAN_DB")
+            if task_id and db_path and os.path.exists(db_path):
+                con = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+                try:
+                    cols = {r[1] for r in con.execute("PRAGMA table_info(task_runs)")}
+                    col = next((c for c in _TOKEN_COLUMNS if c in cols), None)
+                    if col is not None:
+                        row = con.execute(
+                            f"SELECT {col} FROM task_runs "
+                            "WHERE task_id = ? ORDER BY id DESC LIMIT 1",
+                            (task_id,),
+                        ).fetchone()
+                        if row and row[0] is not None:
+                            return int(row[0])
+                finally:
+                    con.close()
+    except Exception as exc:
+        logger.debug("agent-checkpoint: token usage read failed: %s", exc)
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -571,6 +758,9 @@ class TierPlan:
     time_used: Optional[float] = None
     time_cap: Optional[float] = None
     time_left: Optional[float] = None
+    tokens_used: Optional[int] = None
+    tokens_cap: Optional[int] = None
+    tokens_left: Optional[int] = None
 
 
 def compute_tier_plan(
@@ -579,6 +769,7 @@ def compute_tier_plan(
     turns_used: int,
     elapsed: float,
     fired_tiers: list,
+    tokens_used: Optional[int] = None,
 ) -> Optional[TierPlan]:
     """Pure tier math — the unit under test. Returns None when nothing may fire.
 
@@ -596,9 +787,15 @@ def compute_tier_plan(
     * **Penultimate-turn rule:** tier 2 fires no later than the penultimate
       turn (Hermes' own rule, generalized).
     * A 1-turn run gets no checkpoint at all.
+    * **Token axis (0.6.0):** active only when ``tokens`` is in
+      ``enabled_axes``, a token budget exists, AND the host exposed
+      usage (``tokens_used`` is not None) — absent usage, the axis does
+      not exist. It mirrors the time axis: its fraction joins the tier-1
+      effective max, and its tier-2 threshold is the time threshold
+      (default 80%).
     """
     try:
-        if caps.turns_cap is None and caps.time_cap is None:
+        if caps.turns_cap is None and caps.time_cap is None and caps.tokens_cap is None:
             return None
         if caps.turns_cap is not None and int(caps.turns_cap) < 2:
             return None  # 1-turn run: no checkpoint
@@ -616,21 +813,31 @@ def compute_tier_plan(
 
         has_time = caps.time_cap is not None and float(caps.time_cap) > 0
         has_turns = caps.turns_cap is not None and int(caps.turns_cap) >= 2
+        # Token axis (0.6.0): a budget AND exposed usage AND the axis
+        # enabled — all three, or the axis does not exist.
+        has_tokens = (
+            caps.tokens_cap is not None
+            and int(caps.tokens_cap) > 0
+            and tokens_used is not None
+        )
         # Per-axis enable/disable (plan §2).
         if has_time and "time" not in cfg.enabled_axes:
             has_time = False
         if has_turns and "turns" not in cfg.enabled_axes:
             has_turns = False
+        if has_tokens and "tokens" not in cfg.enabled_axes:
+            has_tokens = False
         # Minimum-budget floors: an axis below the floor does not count.
         if has_time and float(caps.time_cap) < cfg.min_budget_floor_seconds:
             has_time = False
         if has_turns and int(caps.turns_cap) < cfg.min_budget_floor_turns:
             has_turns = False
-        if not has_time and not has_turns:
+        if not has_time and not has_turns and not has_tokens:
             return None
 
         time_frac = (elapsed / float(caps.time_cap)) if has_time else None
         turn_frac = (turns_used / int(caps.turns_cap)) if has_turns else None
+        token_frac = (int(tokens_used) / int(caps.tokens_cap)) if has_tokens else None
 
         plan = TierPlan()
         if has_turns:
@@ -641,9 +848,13 @@ def compute_tier_plan(
             plan.time_used = elapsed
             plan.time_cap = float(caps.time_cap)
             plan.time_left = max(0.0, float(caps.time_cap) - elapsed)
+        if has_tokens:
+            plan.tokens_used = int(tokens_used)
+            plan.tokens_cap = int(caps.tokens_cap)
+            plan.tokens_left = max(0, int(caps.tokens_cap) - int(tokens_used))
 
         # --- Tier 1: effective fraction = max of the axis fractions ---
-        axis_fracs = [f for f in (time_frac, turn_frac) if f is not None]
+        axis_fracs = [f for f in (time_frac, turn_frac, token_frac) if f is not None]
         effective = max(axis_fracs) if axis_fracs else 0.0
         plan.effective_fraction = effective
         t1_frac = float(fracs[0])
@@ -661,6 +872,9 @@ def compute_tier_plan(
         if has_time and time_frac is not None and time_frac >= t2_time_frac:
             t2_due = True
         if has_turns and turn_frac is not None and turn_frac >= t2_turn_frac:
+            t2_due = True
+        # Token axis mirrors the time axis's tier-2 threshold (0.8).
+        if has_tokens and token_frac is not None and token_frac >= t2_time_frac:
             t2_due = True
         # Penultimate-turn rule: tier 2 must fire no later than the
         # penultimate turn — if we're at/inside the last turns, fire it now
@@ -708,14 +922,22 @@ def _build_default_text(
         parts_t1.append(f"{plan.turns_used} of {plan.turns_cap} turns "
                         f"({plan.turns_left} left)")
     if plan.time_used is not None:
-        parts_t1.append(f"{_fmt_time(plan.time_used)} of "
-                        f"{_fmt_time(plan.time_cap)} "
-                        f"({_fmt_time(plan.time_left)} left)")
+        parts_t1.append(
+            f"{_fmt_time(plan.time_used)} of "
+            f"{_fmt_time(plan.time_cap)} "
+            f"({_fmt_time(plan.time_left)} left)"
+        )
+    if plan.tokens_used is not None:
+        parts_t1.append(
+            f"{plan.tokens_used} of {plan.tokens_cap} tokens ({plan.tokens_left} left)"
+        )
     rem = []
     if plan.turns_left is not None:
         rem.append(f"{plan.turns_left} turns")
     if plan.time_left is not None:
         rem.append(_fmt_time(plan.time_left))
+    if plan.tokens_left is not None:
+        rem.append(f"{plan.tokens_left} tokens")
     if not parts_t1 and not rem:
         return None  # no axis survived enable/disable/floors
 
@@ -726,9 +948,16 @@ def _build_default_text(
                 n_parts.append(f"{plan.turns_used}/{plan.turns_cap} turns used "
                                f"({plan.turns_left} left)")
             if plan.time_used is not None:
-                n_parts.append(f"{_fmt_time(plan.time_used)}/"
-                               f"{_fmt_time(plan.time_cap)} elapsed "
-                               f"({_fmt_time(plan.time_left)} left)")
+                n_parts.append(
+                    f"{_fmt_time(plan.time_used)}/"
+                    f"{_fmt_time(plan.time_cap)} elapsed "
+                    f"({_fmt_time(plan.time_left)} left)"
+                )
+            if plan.tokens_used is not None:
+                n_parts.append(
+                    f"{plan.tokens_used}/{plan.tokens_cap} tokens "
+                    f"used ({plan.tokens_left} left)"
+                )
             return ("Budget checkpoint: " + "; ".join(n_parts)) if n_parts else None
         # snapshot (default): plan §5 tier 1, verbatim, both-axes shape.
         return (
@@ -781,9 +1010,17 @@ def render_checkpoint_text(
             ctx.update(turns_used=plan.turns_used, turns_cap=plan.turns_cap,
                        turns_left=plan.turns_left)
         if plan.time_used is not None:
-            ctx.update(time_used=_fmt_time(plan.time_used),
-                       time_cap=_fmt_time(plan.time_cap),
-                       time_left=_fmt_time(plan.time_left))
+            ctx.update(
+                time_used=_fmt_time(plan.time_used),
+                time_cap=_fmt_time(plan.time_cap),
+                time_left=_fmt_time(plan.time_left),
+            )
+        if plan.tokens_used is not None:
+            ctx.update(
+                tokens_used=plan.tokens_used,
+                tokens_cap=plan.tokens_cap,
+                tokens_left=plan.tokens_left,
+            )
         out = tmpl
         out = _strip_placeholder_clauses(out, ctx)
         for k, v in ctx.items():
@@ -812,8 +1049,17 @@ def _strip_placeholder_clauses(text: str, ctx: Dict[str, Any]) -> str:
     axis renders ``"T1: 10/20 turns (10 left)."``, instead of a naive
     per-marker delete collapsing the kept clause to ``"10/20 turns ."``.
     """
-    axis_keys = ("turns_used", "turns_cap", "turns_left",
-                 "time_used", "time_cap", "time_left")
+    axis_keys = (
+        "turns_used",
+        "turns_cap",
+        "turns_left",
+        "time_used",
+        "time_cap",
+        "time_left",
+        "tokens_used",
+        "tokens_cap",
+        "tokens_left",
+    )
     pattern = re.compile(r"\{(" + "|".join(axis_keys) + r")\}")
     present = set(ctx)
     out = text
@@ -976,6 +1222,7 @@ class SessionLatches:
                 "run_id": "",
                 "dialect": "chat",
                 "deliverable_path": None,
+                "contract": None,
                 "uncapped_fires": 0,
                 "uncapped_commented": False,
                 "kill_baseline": None,
@@ -1068,6 +1315,10 @@ def _run_context(session_id: str, task_id: str, cfg: PluginConfig,
             # tool call. None is a first-class outcome (unparseable
             # body): movement degrades, the gate stays disengaged.
             st["deliverable_path"] = _kanban_deliverable_path()
+            # Completion contract (0.6.0): parsed from the same body,
+            # cached beside the deliverable path. None = no contract
+            # declared; the contract gate stays disengaged.
+            st["contract"] = _kanban_contract()
             # Kill-rule baseline: the deliverable's state at run start
             # (first plugin contact), captured beside the path read.
             # Fail-open: an uncapturable baseline stays None and the
@@ -1110,9 +1361,16 @@ def _evaluate(session_id: str, task_id: str = "",
         caps, _run_id = _run_context(session_id, task_id, cfg, key)
         turns_used = st["turns"]
         elapsed = LATCHES.elapsed(key)
+        # Token axis (0.6.0): usage is read per evaluation (it grows
+        # during the run, unlike the cached caps) — only when the axis
+        # is enabled and a budget exists. Absent usage → None → inert.
+        tokens_used = None
+        if "tokens" in cfg.enabled_axes and caps.tokens_cap is not None:
+            tokens_used = _tokens_used(session_id, caps)
         handled = st["fired"] if surface == "inject" else st["persisted"]
-        plan = compute_tier_plan(cfg, caps, turns_used, elapsed,
-                                 list(handled))
+        plan = compute_tier_plan(
+            cfg, caps, turns_used, elapsed, list(handled), tokens_used=tokens_used
+        )
         if plan is None or not plan.fire_tiers:
             return None
         return cfg, caps, plan, key
@@ -1325,11 +1583,16 @@ def _log_only_due(cfg: PluginConfig, caps: RunCaps, plan: TierPlan,
 # no discoverable cap on either axis, so it still leaves a durable record.
 # ---------------------------------------------------------------------------
 
+
 def _caps_are_capless(caps: Optional[RunCaps]) -> bool:
-    """True when caps were discovered and NEITHER axis exists — distinct
+    """True when caps were discovered and NO axis exists — distinct
     from "not yet discovered" (``caps is None``)."""
-    return (caps is not None and caps.turns_cap is None
-            and caps.time_cap is None)
+    return (
+        caps is not None
+        and caps.turns_cap is None
+        and caps.time_cap is None
+        and caps.tokens_cap is None
+    )
 
 
 def _uncapped_fallback(cfg: PluginConfig, key: str, session_id: str,
@@ -1768,6 +2031,213 @@ def _kill_block(tool_name: str, args: Any, session_id: str,
 
 
 # ---------------------------------------------------------------------------
+# Completion-contract gate (teeth package, 0.6.0): a PR-producing card
+# declares its contract in the body (see ``parse_contract``); until the
+# named PR's required checks are all green on the PR's current head,
+# the card must not complete — a worker's say-so is not CI evidence.
+# The board-level version of the merge gate's CI half.
+#
+# Engagement is deliberately narrow:
+#   * the contract flag is on for this profile;
+#   * kanban dialect, and the call is ``kanban_complete``;
+#   * the task body declared a contract (no line, no gate).
+# State is read live through the ``gh`` CLI (read-only: ``gh pr view
+# --json``). The gate FAILS OPEN on any gh error — missing binary,
+# network failure, unparsable output: the completion is allowed, the
+# failure is logged, and a comment on the task notes the gate could
+# not verify. It refuses ONLY on proven non-green state: a required
+# check red on the current head, a required check still pending, or a
+# required check with no result on the current head at all (the only
+# evidence, if any, belongs to an older head — stale). Every refusal
+# is logged AND posted as a kanban comment, like the other teeth.
+# ---------------------------------------------------------------------------
+
+_GH_TIMEOUT_SECONDS = 30.0
+
+# Conclusions that count as green for a completed check. SKIPPED is
+# green in GitHub's own branch-protection semantics (a check that was
+# required but legitimately not run does not block a merge).
+_GREEN_CONCLUSIONS = frozenset({"SUCCESS", "SKIPPED"})
+
+
+def _fetch_pr_checks(contract: ContractSpec) -> Optional[dict]:
+    """The PR's current head + check rollup via ``gh pr view`` (read-
+    only). Returns the parsed JSON dict, or None on ANY failure —
+    missing gh, non-zero exit, timeout, unparsable output. None is the
+    fail-open signal: the gate never refuses on unverifiable state."""
+    try:
+        proc = subprocess.run(
+            [
+                "gh",
+                "pr",
+                "view",
+                str(contract.pr_number),
+                "--repo",
+                contract.repo,
+                "--json",
+                "headRefOid,statusCheckRollup",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=_GH_TIMEOUT_SECONDS,
+        )
+        if proc.returncode != 0:
+            logger.warning(
+                "agent-checkpoint contract: gh pr view failed for %s#%d (rc=%s): %s",
+                contract.repo,
+                contract.pr_number,
+                proc.returncode,
+                (proc.stderr or "").strip()[:200],
+            )
+            return None
+        data = json.loads(proc.stdout)
+        return data if isinstance(data, dict) else None
+    except Exception as exc:
+        logger.warning(
+            "agent-checkpoint contract: gh read failed for %s#%d: %s",
+            contract.repo,
+            contract.pr_number,
+            exc,
+        )
+        return None
+
+
+def _contract_check_state(contract: ContractSpec, pr_data: dict) -> tuple:
+    """Pure check-state evaluation: ``("green", [])`` when every
+    required check is green on the PR's current head, else
+    ``("not_green", [problem, ...])`` with one problem per failing
+    required check — red (completed, non-green conclusion), pending
+    (present but not completed), or stale (no result for the check on
+    the current head)."""
+    problems = []
+    try:
+        rollup = pr_data.get("statusCheckRollup") or []
+        by_name: Dict[str, list] = {}
+        for entry in rollup:
+            if not isinstance(entry, dict):
+                continue
+            name = entry.get("name") or entry.get("context")
+            if name:
+                by_name.setdefault(str(name), []).append(entry)
+        for check in contract.required_checks:
+            entries = by_name.get(check)
+            if not entries:
+                problems.append(
+                    f"{check}: no result on the PR's current head "
+                    f"(stale — checks have not reported for this head)"
+                )
+                continue
+            # A check name can appear more than once (re-runs); the
+            # latest entry in the rollup is the current evidence.
+            entry = entries[-1]
+            status = str(entry.get("status") or "").upper()
+            conclusion = str(entry.get("conclusion") or "").upper()
+            if status != "COMPLETED":
+                problems.append(
+                    f"{check}: still {status.lower() or 'pending'} on the current head"
+                )
+            elif conclusion not in _GREEN_CONCLUSIONS:
+                problems.append(
+                    f"{check}: {conclusion.lower() or 'not green'} on the current head"
+                )
+    except Exception as exc:  # malformed gh payload: unverifiable
+        logger.warning(
+            "agent-checkpoint contract: check-state evaluation failed (%s)", exc
+        )
+        return "unknown", [f"unparsable check data: {exc}"]
+    if problems:
+        return "not_green", problems
+    return "green", []
+
+
+def _contract_block(
+    tool_name: str, args: Any, session_id: str, task_id: str
+) -> Optional[Dict[str, str]]:
+    """The contract-gate decision for one tool call: a block directive
+    while the run's declared PR contract is proven non-green, else
+    None (including every fail-open path)."""
+    try:
+        if tool_name != "kanban_complete":
+            return None
+        cfg = load_plugin_config()
+        if not cfg.enabled or not cfg.teeth.contract_gate:
+            return None
+        key = SessionLatches.key(session_id, task_id)
+        st = LATCHES.get(key)
+        if st is None:
+            return None
+        caps, _rid = _run_context(session_id, task_id, cfg, key)
+        if caps.dialect != "kanban":
+            return None
+        contract = st.get("contract")
+        if contract is None:
+            return None  # no Contract line: the card is untouched
+        run_id = run_id_for(session_id, task_id)
+        pr_data = _fetch_pr_checks(contract)
+        if pr_data is None:
+            # Fail OPEN: allow, but leave the unverified completion
+            # visible on the task — silence here would read as proof.
+            logger.warning(
+                "agent-checkpoint contract: could not verify %s#%d "
+                "for %s; allowing completion (fail-open)",
+                contract.repo,
+                contract.pr_number,
+                run_id,
+            )
+            _post_kanban_comment(
+                run_id,
+                (
+                    f"agent-checkpoint contract gate: completion of this "
+                    f"task declares a contract on {contract.repo} PR "
+                    f"#{contract.pr_number}, but the gate could not verify "
+                    f"the PR's checks (gh read failed). The completion was "
+                    f"ALLOWED under the gate's fail-open rule — this "
+                    f"comment is the record that the contract was not "
+                    f"verified for this completion."
+                ),
+            )
+            return None
+        state, problems = _contract_check_state(contract, pr_data)
+        if state == "green":
+            return None
+        if state == "unknown":
+            logger.warning(
+                "agent-checkpoint contract: unverifiable check data "
+                "for %s#%d (%s); allowing completion (fail-open)",
+                contract.repo,
+                contract.pr_number,
+                problems,
+            )
+            return None
+        detail = "; ".join(problems)
+        message = (
+            f"agent-checkpoint contract gate: this task declares a "
+            f"completion contract on {contract.repo} PR "
+            f"#{contract.pr_number}, and its required checks are not "
+            f"all green on the PR's current head: {detail}. "
+            f"kanban_complete is refused until the required checks "
+            f"({', '.join(contract.required_checks)}) pass on the "
+            f"current head. Fix the checks or push the fix, then "
+            f"complete. This refusal was logged and posted on the "
+            f"task."
+        )
+        logger.warning(
+            "agent-checkpoint contract: refused kanban_complete for %s (%s#%d): %s",
+            run_id,
+            contract.repo,
+            contract.pr_number,
+            detail,
+        )
+        _post_kanban_comment(run_id, message)
+        return {"action": "block", "message": message}
+    except Exception as exc:  # fail-open, always
+        logger.warning(
+            "agent-checkpoint: contract check failed (%s); allowing the call", exc
+        )
+        return None
+
+
+# ---------------------------------------------------------------------------
 # Successor resume (teeth package): a reclaimed run's successor currently
 # restarts from zero even though the dead run's checkpoint file is on
 # disk. On the new run's first turn, inject a bounded excerpt of that
@@ -1975,7 +2445,9 @@ def on_pre_tool_call(tool_name: str = "", args: Any = None,
                      **_kw: Any) -> Optional[Dict[str, str]]:
     """``pre_tool_call``: evaluate tiers before a tool runs, then apply
     the teeth vetoes — the half-cap kill rule (0.5.0) first, then the
-    final-tier gate.
+    final-tier gate, then the completion-contract gate (0.6.0; it only
+    ever intercepts ``kanban_complete``, which the other two vetoes
+    allow outright as a wrap-up call).
 
     Normally returns None (observer). When a veto refuses a call it
     returns the loader's block directive ``{"action": "block",
@@ -1989,7 +2461,10 @@ def on_pre_tool_call(tool_name: str = "", args: Any = None,
     kill = _kill_block(tool_name, args, session_id, task_id)
     if kill is not None:
         return kill
-    return _gate_block(tool_name, args, session_id, task_id)
+    gate = _gate_block(tool_name, args, session_id, task_id)
+    if gate is not None:
+        return gate
+    return _contract_block(tool_name, args, session_id, task_id)
 
 
 def on_post_tool_call(tool_name: str = "", session_id: str = "",
